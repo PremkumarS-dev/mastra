@@ -1,6 +1,7 @@
 import type {
   BatchCreateScoresArgs,
   CreateScoreArgs,
+  DeleteScoresArgs,
   GetScoreAggregateArgs,
   GetScoreAggregateResponse,
   GetScoreBreakdownArgs,
@@ -336,7 +337,14 @@ export async function createScore(db: DuckDBConnection, args: CreateScoreArgs): 
 export async function batchCreateScores(db: DuckDBConnection, args: BatchCreateScoresArgs): Promise<void> {
   if (args.scores.length === 0) return;
 
-  const tuples = args.scores.map(s => {
+  const currentScores = new Map<string | symbol, (typeof args.scores)[number]>();
+  for (const score of args.scores) {
+    const key = score.scoreId ?? Symbol();
+    currentScores.delete(key);
+    currentScores.set(key, score);
+  }
+
+  const tuples = [...currentScores.values()].map(s => {
     const legacyScore = s as LegacyScoreRecord;
     const scoreSource = legacyScore.scoreSource ?? legacyScore.source ?? null;
     return `(${[
@@ -390,6 +398,27 @@ export async function batchCreateScores(db: DuckDBConnection, args: BatchCreateS
      VALUES ${tuples.join(',\n       ')}
      ${SCORE_UPSERT_CLAUSE}`,
   );
+}
+
+/**
+ * Delete score events by scoreId. Optional `organizationId` and `resourceId`
+ * values are ANDed into the predicate to restrict deletion to records with
+ * matching scope fields.
+ */
+export async function deleteScores(db: DuckDBConnection, args: DeleteScoresArgs): Promise<void> {
+  if (args.scoreIds.length === 0) return;
+  const placeholders = args.scoreIds.map(() => '?').join(', ');
+  const conditions = [`scoreId IN (${placeholders})`];
+  const params: unknown[] = [...args.scoreIds];
+  if (args.organizationId !== undefined) {
+    conditions.push('organizationId = ?');
+    params.push(args.organizationId);
+  }
+  if (args.resourceId !== undefined) {
+    conditions.push('resourceId = ?');
+    params.push(args.resourceId);
+  }
+  await db.execute(`DELETE FROM score_events WHERE ${conditions.join(' AND ')}`, params);
 }
 
 /** Query score events with filtering, ordering, and pagination. */

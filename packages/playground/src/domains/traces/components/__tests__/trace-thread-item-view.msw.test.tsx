@@ -1,3 +1,11 @@
+import {
+  ActivatedSkillsProvider,
+  useActivatedSkills,
+} from '@mastra/playground-ui/domains/agents/context/activated-skills-context';
+import {
+  BrowserToolCallsProvider,
+  useBrowserToolCalls,
+} from '@mastra/playground-ui/domains/agents/context/browser-tool-calls-context';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import { describe, expect, it, vi } from 'vitest';
@@ -12,8 +20,6 @@ import {
   traceWorkflow,
   traceWorkflowRuns,
 } from './fixtures/trace-thread-item';
-import { ActivatedSkillsProvider, useActivatedSkills } from '@/domains/agents/context/activated-skills-context';
-import { BrowserToolCallsProvider, useBrowserToolCalls } from '@/domains/agents/context/browser-tool-calls-context';
 import { server } from '@/test/msw-server';
 import { renderWithProviders, TEST_BASE_URL } from '@/test/render';
 
@@ -85,7 +91,7 @@ describe('TraceThreadItemView', () => {
   });
 
   describe('when span highlighting is enabled', () => {
-    it('only exposes the highlight button on text-only messages', async () => {
+    it('exposes one highlight button per message, tool calls included', async () => {
       installToolTraceHandlers();
 
       const { queryClient } = renderWithProviders(
@@ -96,11 +102,11 @@ describe('TraceThreadItemView', () => {
       await screen.findByText('Your Paris itinerary is ready.');
       await waitFor(() => expect(queryClient.isFetching()).toBe(0));
 
-      // user text message + final assistant text message; none for the 4 tool messages
-      expect(screen.getAllByRole('button', { name: 'Highlight spans' })).toHaveLength(2);
+      // user text message + 4 tool messages + final assistant text message
+      expect(screen.getAllByRole('button', { name: 'Highlight spans' })).toHaveLength(6);
     });
 
-    it('highlights the spans behind a tool call when its collapsible is opened', async () => {
+    it('highlights the spans behind a tool call only through its button, not by expanding it', async () => {
       installToolTraceHandlers();
       const onHighlightSpans = vi.fn();
 
@@ -114,13 +120,14 @@ describe('TraceThreadItemView', () => {
 
       // Tool badges render in trace order: mcp-tool, client-tool, provider-tool.
       const [hotelBadge] = screen.getAllByTestId('tool-badge');
-      const trigger = within(hotelBadge!).getAllByRole('button')[0]!;
+      fireEvent.click(within(hotelBadge!).getAllByRole('button')[0]!);
+      expect(onHighlightSpans).not.toHaveBeenCalled();
 
-      fireEvent.click(trigger);
-      expect(onHighlightSpans).toHaveBeenCalledWith(['agent-root', 'mcp-tool']);
-
-      fireEvent.click(trigger);
+      // Messages: user, workflow, mcp-tool, client-tool, provider-tool, assistant.
+      const [, , hotelAction] = screen.getAllByRole('button', { name: 'Highlight spans' });
+      fireEvent.click(hotelAction!);
       expect(onHighlightSpans).toHaveBeenCalledTimes(1);
+      expect(onHighlightSpans).toHaveBeenCalledWith(['agent-root', 'mcp-tool']);
     });
   });
 

@@ -29,7 +29,7 @@ import {
 } from '@mastra/core/storage';
 import type { DuckDBConnection } from '../../db/index';
 import { buildWhereClause, buildOrderByClause, buildPaginationClause } from './filters';
-import { v, jsonV, parseJson, parseJsonArray, toDate, toDateOrNull } from './helpers';
+import { v, jsonV, parseJson, parseJsonArray, toDate, toDateOrNull, normalizeTags } from './helpers';
 import { assertDeltaPollingEnabled, deltaPollingFeatureEnabled, encodeDeltaCursor, validateCursorId } from './polling';
 
 // ============================================================================
@@ -52,6 +52,8 @@ const COLUMNS = [
   'entityId',
   'entityName',
   'entityVersionId',
+  'parentEntityVersionId',
+  'rootEntityVersionId',
   'userId',
   'organizationId',
   'resourceId',
@@ -98,6 +100,8 @@ const SPAN_RECONSTRUCT_SELECT = `
     ${argMaxNonNull('entityId')},
     ${argMaxNonNull('entityName')},
     ${argMaxNonNull('entityVersionId')},
+    ${argMaxNonNull('parentEntityVersionId')},
+    ${argMaxNonNull('rootEntityVersionId')},
     ${argMaxNonNull('userId')},
     ${argMaxNonNull('organizationId')},
     ${argMaxNonNull('resourceId')},
@@ -235,6 +239,15 @@ function reconstructForAnchorsWithBoundParam(reconstructSelect: string, anchorCt
     GROUP BY traceId, spanId`;
 }
 
+/**
+ * Event spans are point-in-time, so they end at the instant they start. Rows
+ * written before event spans carried an end time have a null endedAt.
+ */
+function rowEndedAt(row: Record<string, unknown>): Date | null {
+  if (row.isEvent) return toDate(row.startedAt);
+  return toDateOrNull(row.endedAt);
+}
+
 function rowToLightSpanRecord(row: Record<string, unknown>): LightSpanRecord {
   return {
     traceId: row.traceId as string,
@@ -244,13 +257,13 @@ function rowToLightSpanRecord(row: Record<string, unknown>): LightSpanRecord {
     parentSpanId: (row.parentSpanId as string) ?? null,
     isEvent: row.isEvent as boolean,
     startedAt: toDate(row.startedAt),
-    endedAt: toDateOrNull(row.endedAt),
+    endedAt: rowEndedAt(row),
     entityType: (row.entityType as LightSpanRecord['entityType']) ?? null,
     entityId: (row.entityId as string) ?? null,
     entityName: (row.entityName as string) ?? null,
     error: parseJson(row.error),
     createdAt: toDate(row.startedAt), // DuckDB event-sourced — use startedAt as proxy
-    updatedAt: toDateOrNull(row.endedAt),
+    updatedAt: rowEndedAt(row),
   };
 }
 
@@ -273,12 +286,14 @@ function rowToSpanRecord(row: Record<string, unknown>): SpanRecord {
     parentSpanId: (row.parentSpanId as string) ?? null,
     isEvent: row.isEvent as boolean,
     startedAt: toDate(row.startedAt),
-    endedAt: toDateOrNull(row.endedAt),
+    endedAt: rowEndedAt(row),
     experimentId: (row.experimentId as string) ?? null,
     entityType: (row.entityType as SpanRecord['entityType']) ?? null,
     entityId: (row.entityId as string) ?? null,
     entityName: (row.entityName as string) ?? null,
     entityVersionId: (row.entityVersionId as string) ?? null,
+    parentEntityVersionId: (row.parentEntityVersionId as string) ?? null,
+    rootEntityVersionId: (row.rootEntityVersionId as string) ?? null,
     userId: (row.userId as string) ?? null,
     organizationId: (row.organizationId as string) ?? null,
     resourceId: (row.resourceId as string) ?? null,
@@ -492,6 +507,8 @@ interface SpanEventRow {
   entityId: string | null;
   entityName: string | null;
   entityVersionId: string | null;
+  parentEntityVersionId: string | null;
+  rootEntityVersionId: string | null;
   userId: string | null;
   organizationId: string | null;
   resourceId: string | null;
@@ -530,6 +547,8 @@ function toValuesTuple(row: SpanEventRow): string {
     v(row.entityId),
     v(row.entityName),
     v(row.entityVersionId),
+    v(row.parentEntityVersionId),
+    v(row.rootEntityVersionId),
     v(row.userId),
     v(row.organizationId),
     v(row.resourceId),
@@ -572,12 +591,15 @@ function createStartSpanRow(s: CreateSpanArgs['span']): SpanEventRow {
     name: s.name,
     spanType: s.spanType,
     isEvent: s.isEvent,
-    endedAt: null,
+    // Event spans are point-in-time: they end at the instant they start.
+    endedAt: s.isEvent ? s.startedAt : null,
     experimentId: s.experimentId ?? null,
     entityType: s.entityType ?? null,
     entityId: s.entityId ?? null,
     entityName: s.entityName ?? null,
     entityVersionId: s.entityVersionId ?? null,
+    parentEntityVersionId: s.parentEntityVersionId ?? null,
+    rootEntityVersionId: s.rootEntityVersionId ?? null,
     userId: s.userId ?? null,
     organizationId: s.organizationId ?? null,
     resourceId: s.resourceId ?? null,
@@ -590,7 +612,7 @@ function createStartSpanRow(s: CreateSpanArgs['span']): SpanEventRow {
     serviceName: s.serviceName ?? null,
     attributes: (s.attributes as Record<string, unknown>) ?? null,
     metadata: (s.metadata as Record<string, unknown>) ?? null,
-    tags: s.tags ?? null,
+    tags: s.tags == null ? null : normalizeTags(s.tags),
     scope: (s.scope as Record<string, unknown>) ?? null,
     links: null,
     input: (s.input as Record<string, unknown>) ?? null,
@@ -616,6 +638,8 @@ function createEndSpanRow(s: CreateSpanArgs['span']): SpanEventRow {
     entityId: s.entityId ?? null,
     entityName: s.entityName ?? null,
     entityVersionId: s.entityVersionId ?? null,
+    parentEntityVersionId: s.parentEntityVersionId ?? null,
+    rootEntityVersionId: s.rootEntityVersionId ?? null,
     userId: s.userId ?? null,
     organizationId: s.organizationId ?? null,
     resourceId: s.resourceId ?? null,
@@ -628,7 +652,7 @@ function createEndSpanRow(s: CreateSpanArgs['span']): SpanEventRow {
     serviceName: s.serviceName ?? null,
     attributes: (s.attributes as Record<string, unknown>) ?? null,
     metadata: (s.metadata as Record<string, unknown>) ?? null,
-    tags: s.tags ?? null,
+    tags: s.tags == null ? null : normalizeTags(s.tags),
     scope: (s.scope as Record<string, unknown>) ?? null,
     links: s.links ?? null,
     input: (s.input as Record<string, unknown>) ?? null,
@@ -641,7 +665,7 @@ function createEndSpanRow(s: CreateSpanArgs['span']): SpanEventRow {
 /** Insert a 'start' event for a new span. */
 export async function createSpan(db: DuckDBConnection, args: CreateSpanArgs): Promise<void> {
   const rows = [createStartSpanRow(args.span)];
-  if (args.span.endedAt) {
+  if (args.span.endedAt && !args.span.isEvent) {
     rows.push(createEndSpanRow(args.span));
   }
   await insertSpanEvents(db, rows);
@@ -652,7 +676,7 @@ export async function batchCreateSpans(db: DuckDBConnection, args: BatchCreateSp
   if (args.records.length === 0) return;
   const rows = args.records.flatMap(record => {
     const events = [createStartSpanRow(record)];
-    if (record.endedAt) {
+    if (record.endedAt && !record.isEvent) {
       events.push(createEndSpanRow(record));
     }
     return events;
@@ -788,28 +812,36 @@ async function listTraceRows<TSpan>(
   if (!hasPostAggFilters) {
     // Fast path: order + paginate in the prefilter, reconstruct only the page.
     // Only `startedAt` reaches here (per SAFE_PREFILTER_ORDER_FIELDS), and on
-    // start rows it lives in the `timestamp` column.
-    const prefilterOrderBy = `ORDER BY timestamp ${orderDir}`;
+    // start rows it lives in the `timestamp` column. A span can have more than
+    // one start row (the end event is also written as a create), so group first.
+    const prefilterOrderBy = `ORDER BY anchorStartedAt ${orderDir}, traceId, spanId`;
     const offset = page * perPage;
 
     const countSql = `
-      SELECT COUNT(*) as total
+      SELECT COUNT(DISTINCT (traceId, spanId)) as total
       FROM span_events AS ${outerAlias}
       ${prefilterWhere}
     `;
     const countResult = await db.query<{ total: number }>(countSql, prefilterParams);
     const total = Number(countResult[0]?.total ?? 0);
 
+    // An empty page_roots makes the reconstruction time bound NULL, which
+    // disables filter pushdown and scans all of span_events. Skip it.
+    if (total === 0 || offset >= total) {
+      return { pagination: { total, page, perPage, hasMore: false }, spans: [] };
+    }
+
     const pageSql = `
       WITH page_roots AS (
-        SELECT traceId, spanId, timestamp AS anchorStartedAt
+        SELECT traceId, spanId, min(timestamp) AS anchorStartedAt
         FROM span_events AS ${outerAlias}
         ${prefilterWhere}
+        GROUP BY traceId, spanId
         ${prefilterOrderBy}
         LIMIT ? OFFSET ?
       )
       ${reconstructForAnchors(reconstructSelect, 'page_roots')}
-      ${buildOrderByClause(orderBy)}
+      ${buildOrderByClause(orderBy)}, traceId, spanId
     `;
     const rows = await db.query(pageSql, [...prefilterParams, perPage, offset]);
     const spans = rows.map(row => mapRow(row as Record<string, unknown>));
@@ -851,6 +883,10 @@ async function listTraceRows<TSpan>(
   `;
   const countResult = await db.query<{ total: number }>(countSql, [...prefilterParams, ...postAggParams]);
   const total = Number(countResult[0]?.total ?? 0);
+
+  if (total === 0 || page * perPage >= total) {
+    return { pagination: { total, page, perPage, hasMore: false }, spans: [] };
+  }
 
   const dataSql = `
     ${cteSql},
@@ -924,9 +960,10 @@ export async function listTraces(db: DuckDBConnection, args: ListTracesArgs): Pr
 
     const dataSql = `
       WITH candidate_roots AS (
-        SELECT traceId, spanId, cursorId
+        SELECT traceId, spanId, max(cursorId) AS cursorId
         FROM span_events AS ${outerAlias}
         ${prefilterWhere}
+        GROUP BY traceId, spanId
       ),
       root_spans AS (
         SELECT reconstructed.*, candidate_roots.cursorId AS anchorCursorId
@@ -1125,9 +1162,10 @@ export async function listBranches(db: DuckDBConnection, args: ListBranchesArgs)
 
     const dataSql = `
       WITH candidate_anchors AS (
-        SELECT traceId, spanId, cursorId
+        SELECT traceId, spanId, max(cursorId) AS cursorId
         FROM span_events AS ${outerAlias}
         ${prefilterWhere}
+        GROUP BY traceId, spanId
       ),
       branch_anchors AS (
         SELECT reconstructed.*, candidate_anchors.cursorId AS anchorCursorId
@@ -1196,21 +1234,22 @@ export async function listBranches(db: DuckDBConnection, args: ListBranchesArgs)
   if (!hasPostAggFilters) {
     // Fast path: order + paginate in the prefilter, reconstruct only the page.
     // Only `startedAt` reaches here (per SAFE_PREFILTER_ORDER_FIELDS), and on
-    // start rows it lives in the `timestamp` column.
-    const prefilterOrderBy = `ORDER BY timestamp ${orderDir}`;
+    // start rows it lives in the `timestamp` column. A span can have more than
+    // one start row (the end event is also written as a create), so group first.
+    const prefilterOrderBy = `ORDER BY anchorStartedAt ${orderDir}, traceId, spanId`;
     const offset = page * perPage;
 
     const countSql = `
-      SELECT COUNT(*) as total
+      SELECT COUNT(DISTINCT (traceId, spanId)) as total
       FROM span_events AS ${outerAlias}
       ${prefilterWhere}
     `;
     const countResult = await db.query<{ total: number }>(countSql, prefilterParams);
     const total = Number(countResult[0]?.total ?? 0);
 
-    if (total === 0) {
+    if (total === 0 || page * perPage >= total) {
       return {
-        pagination: { total: 0, page, perPage, hasMore: false },
+        pagination: { total, page, perPage, hasMore: false },
         branches: [],
         ...(deltaPollingFeatureEnabled() ? { deltaCursor: currentDeltaCursor } : {}),
       };
@@ -1218,14 +1257,15 @@ export async function listBranches(db: DuckDBConnection, args: ListBranchesArgs)
 
     const pageSql = `
       WITH page_anchors AS (
-        SELECT traceId, spanId, timestamp AS anchorStartedAt
+        SELECT traceId, spanId, min(timestamp) AS anchorStartedAt
         FROM span_events AS ${outerAlias}
         ${prefilterWhere}
+        GROUP BY traceId, spanId
         ${prefilterOrderBy}
         LIMIT ? OFFSET ?
       )
       ${reconstructForAnchors(SPAN_RECONSTRUCT_SELECT, 'page_anchors')}
-      ${buildOrderByClause(orderBy)}
+      ${buildOrderByClause(orderBy)}, traceId, spanId
     `;
     const rows = await db.query(pageSql, [...prefilterParams, perPage, offset]);
     const spans = rows.map(row => rowToSpanRecord(row as Record<string, unknown>));
@@ -1264,9 +1304,9 @@ export async function listBranches(db: DuckDBConnection, args: ListBranchesArgs)
   const countResult = await db.query<{ total: number }>(countSql, [...prefilterParams, ...postAggParams]);
   const total = Number(countResult[0]?.total ?? 0);
 
-  if (total === 0) {
+  if (total === 0 || page * perPage >= total) {
     return {
-      pagination: { total: 0, page, perPage, hasMore: false },
+      pagination: { total, page, perPage, hasMore: false },
       branches: [],
       ...(deltaPollingFeatureEnabled() ? { deltaCursor: currentDeltaCursor } : {}),
     };
@@ -1408,7 +1448,7 @@ async function getBranchDeltaCursor(db: DuckDBConnection, filters: ListBranchesA
     branch_anchors AS (
       SELECT reconstructed.*, candidate_anchors.cursorId AS anchorCursorId
       FROM (
-        ${SPAN_RECONSTRUCT_SELECT}
+        ${buildPostAggReconstructSelect(postAgg, 'startedAt')}
         WHERE (traceId, spanId) IN (SELECT traceId, spanId FROM candidate_anchors)
         GROUP BY traceId, spanId
       ) AS reconstructed

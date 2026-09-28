@@ -2,10 +2,7 @@ import type { MastraClient } from '@mastra/client-js';
 import { useMastraClient } from '@mastra/react';
 import { queryOptions, useQueries, useQuery } from '@tanstack/react-query';
 import type { UseQueryResult } from '@tanstack/react-query';
-import type { SearchableSpan } from '../types';
-import { selectSearchableSpans } from '../utils';
-
-const IMMUTABLE_CACHE_TIME = 1000 * 60 * 60 * 24 * 30; // 30 days, massive cache, span data is immutable
+import { toSearchableSpans } from '../utils';
 
 /**
  * Key, fetcher and stale policy of the `trace-spans` query. Every observer of this key must
@@ -23,11 +20,8 @@ export const traceSpansQueryOptions = (client: MastraClient, traceId: string | n
       return res;
     },
     enabled: !!traceId,
-    staleTime: query => {
-      const data = query.state.data;
-      const isFinished = data?.spans.every(span => Boolean(span.endedAt));
-      return isFinished ? IMMUTABLE_CACHE_TIME : 0;
-    },
+    // Resumed runs and delayed exports can append spans even when every known span has ended.
+    staleTime: 0,
   });
 
 /**
@@ -39,19 +33,30 @@ export const traceSpansQueryOptions = (client: MastraClient, traceId: string | n
  * these spans -- `input`, `output` and `attributes` included -- so the
  * projection would only hide content the reader is looking at.
  */
+export type TraceSpansData = Awaited<ReturnType<MastraClient['getTrace']>>;
+type SearchableTraceSpansData = Omit<NonNullable<TraceSpansData>, 'spans'> & {
+  spans: Array<NonNullable<TraceSpansData>['spans'][number] & { searchText: string }>;
+};
+
+const selectSearchableTraceSpans = (data: TraceSpansData): SearchableTraceSpansData | null =>
+  data ? { ...data, spans: toSearchableSpans(data.spans) } : null;
+
 export function useTraceSpans(
   traceId: string | null | undefined,
-): UseQueryResult<{ traceId: string; spans: SearchableSpan[] } | null> {
+  { passive = false }: { passive?: boolean } = {},
+): UseQueryResult<SearchableTraceSpansData | null> {
   const client = useMastraClient();
 
   return useQuery({
     ...traceSpansQueryOptions(client, traceId),
+    // History rows share updates but leave automatic refreshes to the selected detail.
+    refetchOnMount: !passive,
+    refetchOnWindowFocus: !passive,
+    refetchOnReconnect: !passive,
     // Builds each span's search haystack once per fetch, cached with the query.
-    select: selectSearchableSpans,
+    select: selectSearchableTraceSpans,
   });
 }
-
-export type TraceSpansData = Awaited<ReturnType<MastraClient['getTrace']>>;
 
 /**
  * Observes the `trace-spans` query of several traces at once and projects each one with `select`.
@@ -67,6 +72,9 @@ export function useTraceSpansQueries<T>(
   return useQueries({
     queries: traceIds.map(traceId => ({
       ...traceSpansQueryOptions(client, traceId),
+      refetchOnMount: false,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
       select: (data: TraceSpansData) => select(traceId, data),
     })),
     combine: results =>

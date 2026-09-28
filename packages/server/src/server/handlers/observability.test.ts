@@ -25,6 +25,7 @@ import {
   LIST_SCORES_BY_SPAN_ROUTE,
 } from './observability';
 import { LIST_METRICS, NEW_ROUTES } from './observability-new-endpoints';
+import { NO_OBSERVABILITY_STORAGE_CAPABILITIES } from './observability-shared';
 import { createTestServerContext } from './test-utils';
 
 // Mock scoreTraces
@@ -54,6 +55,7 @@ const createMockObservabilityStore = () => ({
   listLogs: vi.fn(),
   listScores: vi.fn(),
   createScore: vi.fn(),
+  deleteScores: vi.fn(),
   getScoreById: vi.fn(),
   getScoreAggregate: vi.fn(),
   getScoreBreakdown: vi.fn(),
@@ -61,6 +63,7 @@ const createMockObservabilityStore = () => ({
   getScorePercentiles: vi.fn(),
   listFeedback: vi.fn(),
   createFeedback: vi.fn(),
+  deleteFeedback: vi.fn(),
   updateFeedbackReviewStatus: vi.fn(),
   getFeedbackAggregate: vi.fn(),
   getFeedbackBreakdown: vi.fn(),
@@ -2137,6 +2140,130 @@ describe('Observability Handlers', () => {
     });
   });
 
+  describe('DELETE_SCORES_ROUTE', () => {
+    it('should delete scores successfully', async () => {
+      (mockObservabilityStore.deleteScores as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      const result = await NEW_ROUTES.DELETE_SCORES.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        scoreIds: ['score-1', 'score-2'],
+      });
+
+      expect(result).toEqual({ success: true });
+      expect(mockObservabilityStore.deleteScores).toHaveBeenCalledWith({ scoreIds: ['score-1', 'score-2'] });
+      expect(handleErrorSpy).not.toHaveBeenCalled();
+    });
+
+    it('should pass tenant scope to the storage layer', async () => {
+      (mockObservabilityStore.deleteScores as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      await NEW_ROUTES.DELETE_SCORES.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        scoreIds: ['score-1'],
+        organizationId: 'org-1',
+        resourceId: 'res-1',
+      });
+
+      expect(mockObservabilityStore.deleteScores).toHaveBeenCalledWith({
+        scoreIds: ['score-1'],
+        organizationId: 'org-1',
+        resourceId: 'res-1',
+      });
+    });
+
+    it('should throw 500 when storage is not available', async () => {
+      const mastraWithoutStorage = createMockMastra(undefined);
+
+      try {
+        await NEW_ROUTES.DELETE_SCORES.handler({
+          ...createTestServerContext({ mastra: mastraWithoutStorage }),
+          scoreIds: ['score-1'],
+        });
+        expect.fail('expected handler to throw');
+      } catch (error) {
+        expect(error).toBeInstanceOf(HTTPException);
+        expect((error as HTTPException).status).toBe(500);
+        expect((error as HTTPException).message).toBe('Storage is not available');
+      }
+    });
+
+    it('should call handleError when storage throws', async () => {
+      const storageError = new Error('Database delete failed');
+      (mockObservabilityStore.deleteScores as ReturnType<typeof vi.fn>).mockRejectedValue(storageError);
+
+      await expect(
+        NEW_ROUTES.DELETE_SCORES.handler({
+          ...createTestServerContext({ mastra: mockMastra }),
+          scoreIds: ['score-1'],
+        }),
+      ).rejects.toThrow();
+
+      expect(handleErrorSpy).toHaveBeenCalledWith(storageError, "Error calling: 'delete scores'");
+    });
+  });
+
+  describe('DELETE_FEEDBACK_ROUTE', () => {
+    it('should delete feedback successfully', async () => {
+      (mockObservabilityStore.deleteFeedback as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      const result = await NEW_ROUTES.DELETE_FEEDBACK.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        feedbackIds: ['fb-1', 'fb-2'],
+      });
+
+      expect(result).toEqual({ success: true });
+      expect(mockObservabilityStore.deleteFeedback).toHaveBeenCalledWith({ feedbackIds: ['fb-1', 'fb-2'] });
+      expect(handleErrorSpy).not.toHaveBeenCalled();
+    });
+
+    it('should pass tenant scope to the storage layer', async () => {
+      (mockObservabilityStore.deleteFeedback as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      await NEW_ROUTES.DELETE_FEEDBACK.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        feedbackIds: ['fb-1'],
+        organizationId: 'org-1',
+        resourceId: 'res-1',
+      });
+
+      expect(mockObservabilityStore.deleteFeedback).toHaveBeenCalledWith({
+        feedbackIds: ['fb-1'],
+        organizationId: 'org-1',
+        resourceId: 'res-1',
+      });
+    });
+
+    it('should throw 500 when storage is not available', async () => {
+      const mastraWithoutStorage = createMockMastra(undefined);
+
+      try {
+        await NEW_ROUTES.DELETE_FEEDBACK.handler({
+          ...createTestServerContext({ mastra: mastraWithoutStorage }),
+          feedbackIds: ['fb-1'],
+        });
+        expect.fail('expected handler to throw');
+      } catch (error) {
+        expect(error).toBeInstanceOf(HTTPException);
+        expect((error as HTTPException).status).toBe(500);
+        expect((error as HTTPException).message).toBe('Storage is not available');
+      }
+    });
+
+    it('should call handleError when storage throws', async () => {
+      const storageError = new Error('Database delete failed');
+      (mockObservabilityStore.deleteFeedback as ReturnType<typeof vi.fn>).mockRejectedValue(storageError);
+
+      await expect(
+        NEW_ROUTES.DELETE_FEEDBACK.handler({
+          ...createTestServerContext({ mastra: mockMastra }),
+          feedbackIds: ['fb-1'],
+        }),
+      ).rejects.toThrow();
+
+      expect(handleErrorSpy).toHaveBeenCalledWith(storageError, "Error calling: 'delete feedback'");
+    });
+  });
+
   describe('GET_METRIC_AGGREGATE_ROUTE', () => {
     it('should return metric aggregate successfully', async () => {
       const mockResult = {
@@ -3281,6 +3408,89 @@ describe('Observability Handlers', () => {
       ).rejects.toThrow();
 
       expect(handleErrorSpy).toHaveBeenCalledWith(storageError, "Error calling: 'get tags'");
+    });
+  });
+
+  describe('discovery routes on stores without discovery support', () => {
+    const createLegacyMastra = async () => {
+      const { ObservabilityStorage } = await import('@mastra/core/storage');
+      class LegacyObservabilityStore extends ObservabilityStorage {}
+      const storage = createMockStorage(
+        new LegacyObservabilityStore() as unknown as ReturnType<typeof createMockObservabilityStore>,
+        mockScoresStore,
+      );
+      return createMockMastra(storage);
+    };
+
+    it.each([
+      ['GET_ENTITY_TYPES', {}, { entityTypes: [] }],
+      ['GET_ENTITY_NAMES', {}, { names: [] }],
+      ['GET_SERVICE_NAMES', {}, { serviceNames: [] }],
+      ['GET_ENVIRONMENTS', {}, { environments: [] }],
+      ['GET_TAGS', {}, { tags: [] }],
+      ['GET_METRIC_NAMES', {}, { names: [] }],
+      ['GET_METRIC_LABEL_KEYS', { metricName: 'mastra_agent_duration_ms' }, { keys: [] }],
+      ['GET_METRIC_LABEL_VALUES', { metricName: 'mastra_agent_duration_ms', labelKey: 'agent' }, { values: [] }],
+    ] as const)('%s returns an empty result instead of an error', async (routeKey, params, expected) => {
+      const mastra = await createLegacyMastra();
+      const route = NEW_ROUTES[routeKey] as { handler: (args: unknown) => Promise<unknown> };
+
+      const result = await route.handler({ ...createTestServerContext({ mastra }), ...params });
+
+      expect(result).toEqual(expected);
+      expect(handleErrorSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET_CAPABILITIES', () => {
+    it('reports every flag as unsupported when no storage is configured', async () => {
+      const result = await NEW_ROUTES.GET_CAPABILITIES.handler({
+        ...createTestServerContext({ mastra: createMockMastra(undefined) }),
+      });
+
+      expect(result).toEqual({
+        observabilityStorageType: null,
+        capabilities: NO_OBSERVABILITY_STORAGE_CAPABILITIES,
+      });
+    });
+
+    it('reports the configured store and its declared capabilities', async () => {
+      const { ObservabilityStorage } = await import('@mastra/core/storage');
+      class DeclaredStore extends ObservabilityStorage {
+        override getFeatures() {
+          return ['metrics', 'tag-discovery', 'trace-query', 'feedback'] as const;
+        }
+      }
+      const storage = createMockStorage(
+        new DeclaredStore() as unknown as ReturnType<typeof createMockObservabilityStore>,
+        mockScoresStore,
+      );
+
+      const result = await NEW_ROUTES.GET_CAPABILITIES.handler({
+        ...createTestServerContext({ mastra: createMockMastra(storage) }),
+      });
+
+      expect(result.observabilityStorageType).toBe('DeclaredStore');
+      expect(result.capabilities).toMatchObject({ metrics: true, logs: false, traceQuery: true, feedback: true });
+      expect(result.capabilities.discovery.tags).toBe(true);
+    });
+
+    it('reports legacy stores without feature declarations as unsupported', async () => {
+      const { ObservabilityStorage } = await import('@mastra/core/storage');
+      class LegacyStore extends ObservabilityStorage {}
+      const storage = createMockStorage(
+        new LegacyStore() as unknown as ReturnType<typeof createMockObservabilityStore>,
+        mockScoresStore,
+      );
+
+      const result = await NEW_ROUTES.GET_CAPABILITIES.handler({
+        ...createTestServerContext({ mastra: createMockMastra(storage) }),
+      });
+
+      expect(result).toEqual({
+        observabilityStorageType: 'LegacyStore',
+        capabilities: NO_OBSERVABILITY_STORAGE_CAPABILITIES,
+      });
     });
   });
 });

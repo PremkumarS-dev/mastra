@@ -49,6 +49,7 @@ const createMockWorkflow = (result: Record<string, unknown>, resumeResults?: Rec
 describe('executeTarget', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(isSupportedLanguageModel).mockReturnValue(true);
   });
 
   describe('agent target', () => {
@@ -114,6 +115,8 @@ describe('executeTarget', () => {
       expect(mockAgent.generate).toHaveBeenCalledWith('Hello', {
         scorers: {},
         returnScorerData: true,
+        abortSignal: undefined,
+        tracingOptions: { traceId: expect.stringMatching(/^[0-9a-f]{32}$/) },
       });
     });
 
@@ -164,6 +167,8 @@ describe('executeTarget', () => {
       expect(mockAgent.generate).toHaveBeenCalledWith(messagesInput, {
         scorers: {},
         returnScorerData: true,
+        abortSignal: undefined,
+        tracingOptions: { traceId: expect.stringMatching(/^[0-9a-f]{32}$/) },
       });
     });
 
@@ -186,24 +191,95 @@ describe('executeTarget', () => {
       expect(mockAgent.generate).toHaveBeenCalledWith('', {
         scorers: {},
         returnScorerData: true,
+        abortSignal: undefined,
+        tracingOptions: { traceId: expect.stringMatching(/^[0-9a-f]{32}$/) },
       });
     });
 
-    it('captures error as string when agent throws', async () => {
-      const mockAgent = createMockAgent('', true);
+    it('returns the trace ID assigned to a failed agent invocation', async () => {
+      let assignedTraceId: string | undefined;
+      let tracingMetadata: Record<string, unknown> | undefined;
+      const mockAgent = {
+        ...createMockAgent(''),
+        generate: vi.fn().mockImplementation(async (_input: unknown, options: any) => {
+          assignedTraceId = options.tracingOptions.traceId;
+          tracingMetadata = options.tracingOptions.metadata;
+          throw new Error('Provider rejected request');
+        }),
+      } as unknown as Agent;
 
-      const result = await executeTarget(mockAgent, 'agent', {
-        id: 'item-4',
-        datasetId: 'ds-1',
-        input: 'Test',
-        groundTruth: null,
-        version: new Date(),
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      });
+      const result = await executeTarget(
+        mockAgent,
+        'agent',
+        {
+          id: 'item-4',
+          datasetId: 'ds-1',
+          input: 'Test',
+          groundTruth: null,
+          version: new Date(),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+        { experimentId: 'experiment-1' },
+      );
 
+      expect(assignedTraceId).toMatch(/^[0-9a-f]{32}$/);
+      expect(tracingMetadata).toEqual({ experimentId: 'experiment-1' });
       expect(result.output).toBeNull();
-      expect(result.error).toEqual(expect.objectContaining({ message: 'Agent error' }));
+      expect(result.error).toEqual(expect.objectContaining({ message: 'Provider rejected request' }));
+      expect(result.traceId).toBe(assignedTraceId);
+      expect(result.spanId).toBeUndefined();
+    });
+
+    it('retains the assigned trace ID when a timeout wins before generation settles', async () => {
+      let assignedTraceId: string | undefined;
+      const generate = vi.fn().mockImplementation(async (_input: unknown, options: any) => {
+        assignedTraceId = options.tracingOptions.traceId;
+        return new Promise(() => {});
+      });
+      const mockAgent = { ...createMockAgent(''), generate } as unknown as Agent;
+      const controller = new AbortController();
+
+      const execution = executeTarget(
+        mockAgent,
+        'agent',
+        { id: 'item-timeout', input: 'Test' },
+        { signal: controller.signal },
+      );
+      await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
+      controller.abort(new DOMException('Experiment item timed out.', 'TimeoutError'));
+
+      const result = await execution;
+      expect(result.error).toEqual(expect.objectContaining({ message: 'Experiment item timed out.' }));
+      expect(result.traceId).toBe(assignedTraceId);
+      expect(result.traceId).toMatch(/^[0-9a-f]{32}$/);
+    });
+
+    it('returns null trace ID when model resolution fails before agent invocation', async () => {
+      const generate = vi.fn();
+      const mockAgent = {
+        ...createMockAgent(''),
+        getModel: vi.fn().mockRejectedValue(new Error('Model resolution failed')),
+        generate,
+      } as unknown as Agent;
+
+      const result = await executeTarget(mockAgent, 'agent', { id: 'item-model-failure', input: 'Test' });
+
+      expect(generate).not.toHaveBeenCalled();
+      expect(result.error).toEqual(expect.objectContaining({ message: 'Model resolution failed' }));
+      expect(result.traceId).toBeNull();
+    });
+
+    it('uses the agent result trace ID on success', async () => {
+      const mockAgent = {
+        ...createMockAgent(''),
+        generate: vi.fn().mockResolvedValue({ text: 'done', traceId: 'result-trace-id' }),
+      } as unknown as Agent;
+
+      const result = await executeTarget(mockAgent, 'agent', { id: 'item-success', input: 'Test' });
+
+      expect(result.error).toBeNull();
+      expect(result.traceId).toBe('result-trace-id');
     });
 
     it('shares model-resolution context with legacy generation', async () => {
@@ -251,10 +327,27 @@ describe('executeTarget', () => {
       expect(mockAgent.generateLegacy).toHaveBeenCalledWith('Test', {
         scorers: {},
         returnScorerData: true,
+        abortSignal: undefined,
+        tracingOptions: { traceId: expect.stringMatching(/^[0-9a-f]{32}$/) },
       });
+    });
 
-      // Reset mock
-      vi.mocked(isSupportedLanguageModel).mockReturnValue(true);
+    it('returns the trace ID assigned to a failed legacy agent invocation', async () => {
+      vi.mocked(isSupportedLanguageModel).mockReturnValue(false);
+      let assignedTraceId: string | undefined;
+      const mockAgent = {
+        ...createMockAgent(''),
+        generateLegacy: vi.fn().mockImplementation(async (_input: unknown, options: any) => {
+          assignedTraceId = options.tracingOptions.traceId;
+          throw new Error('Legacy provider rejected request');
+        }),
+      } as unknown as Agent;
+
+      const result = await executeTarget(mockAgent, 'agent', { id: 'item-legacy-failure', input: 'Test' });
+
+      expect(assignedTraceId).toMatch(/^[0-9a-f]{32}$/);
+      expect(result.error).toEqual(expect.objectContaining({ message: 'Legacy provider rejected request' }));
+      expect(result.traceId).toBe(assignedTraceId);
     });
   });
 
@@ -996,6 +1089,209 @@ describe('executeTarget', () => {
         expect.objectContaining({
           resumeData: { value: 'a' },
           step: 'step-a',
+        }),
+      );
+    });
+
+    it('resumes a later suspended branch when an earlier branch has no data', async () => {
+      const mockWorkflow = createMockWorkflow(
+        {
+          status: 'suspended',
+          suspended: [['branch-a'], ['branch-b']],
+          suspendPayload: {},
+          steps: {},
+          traceId: 'trace-later-branch',
+          spanId: 'span-later-branch',
+        },
+        [
+          {
+            status: 'success',
+            result: { done: true },
+            steps: {},
+            traceId: 'trace-later-branch',
+            spanId: 'span-later-branch',
+          },
+        ],
+      );
+
+      const result = await executeTarget(mockWorkflow, 'workflow', {
+        id: 'item-later-branch',
+        datasetId: 'ds-1',
+        input: { data: 'test' },
+        groundTruth: null,
+        version: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        resumeSteps: { 'branch-b': { value: 'b' } },
+      });
+
+      expect(result.error).toBeNull();
+      expect(result.output).toEqual({ done: true });
+      const run = await (mockWorkflow.createRun as ReturnType<typeof vi.fn>).mock.results[0].value;
+      // branch-a has no data, so branch-b (later) should be resumed instead of blocking.
+      expect(run.resume).toHaveBeenCalledTimes(1);
+      expect(run.resume).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resumeData: { value: 'b' },
+          step: 'branch-b',
+        }),
+      );
+    });
+
+    it('resumes a later top-level branch when an earlier nested branch has no data', async () => {
+      const mockWorkflow = createMockWorkflow(
+        {
+          status: 'suspended',
+          suspended: [['branch-a', 'nested'], ['branch-b']],
+          suspendPayload: {},
+          steps: {},
+          traceId: 'trace-nested-branch',
+          spanId: 'span-nested-branch',
+        },
+        [
+          {
+            status: 'success',
+            result: { done: true },
+            steps: {},
+            traceId: 'trace-nested-branch',
+            spanId: 'span-nested-branch',
+          },
+        ],
+      );
+
+      const result = await executeTarget(mockWorkflow, 'workflow', {
+        id: 'item-nested-branch',
+        datasetId: 'ds-1',
+        input: { data: 'test' },
+        groundTruth: null,
+        version: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        resumeSteps: { 'branch-b': { value: 'b' } },
+      });
+
+      expect(result.error).toBeNull();
+      const run = await (mockWorkflow.createRun as ReturnType<typeof vi.fn>).mock.results[0].value;
+      expect(run.resume).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resumeData: { value: 'b' },
+          step: 'branch-b',
+        }),
+      );
+    });
+
+    it('stays suspended when no resume data matches any suspended branch', async () => {
+      const mockWorkflow = createMockWorkflow({
+        status: 'suspended',
+        suspended: [['branch-a'], ['branch-b']],
+        suspendPayload: { prompt: 'Input needed' },
+        steps: {},
+        traceId: 'trace-no-match',
+        spanId: 'span-no-match',
+      });
+
+      const result = await executeTarget(mockWorkflow, 'workflow', {
+        id: 'item-no-match',
+        datasetId: 'ds-1',
+        input: { data: 'test' },
+        groundTruth: null,
+        version: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        resumeSteps: { 'branch-c': { value: 'c' } },
+      });
+
+      expect(result.output).toEqual({ prompt: 'Input needed' });
+      expect(result.error).toEqual(
+        expect.objectContaining({
+          message: expect.stringContaining('provide resume data'),
+        }),
+      );
+      const run = await (mockWorkflow.createRun as ReturnType<typeof vi.fn>).mock.results[0].value;
+      expect(run.resume).not.toHaveBeenCalled();
+    });
+
+    it('selects a later branch from metadata.resumeSteps', async () => {
+      const mockWorkflow = createMockWorkflow(
+        {
+          status: 'suspended',
+          suspended: [['branch-a'], ['branch-b']],
+          suspendPayload: {},
+          steps: {},
+          traceId: 'trace-meta-later',
+          spanId: 'span-meta-later',
+        },
+        [
+          {
+            status: 'success',
+            result: { done: true },
+            steps: {},
+            traceId: 'trace-meta-later',
+            spanId: 'span-meta-later',
+          },
+        ],
+      );
+
+      const result = await executeTarget(mockWorkflow, 'workflow', {
+        id: 'item-meta-later',
+        datasetId: 'ds-1',
+        input: { data: 'test' },
+        groundTruth: null,
+        version: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        metadata: { resumeSteps: { 'branch-b': { value: 'b' } } },
+      });
+
+      expect(result.error).toBeNull();
+      const run = await (mockWorkflow.createRun as ReturnType<typeof vi.fn>).mock.results[0].value;
+      expect(run.resume).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resumeData: { value: 'b' },
+          step: 'branch-b',
+        }),
+      );
+    });
+
+    it('forwards a falsy defined per-step payload to a later branch', async () => {
+      const mockWorkflow = createMockWorkflow(
+        {
+          status: 'suspended',
+          suspended: [['branch-a'], ['branch-b']],
+          suspendPayload: {},
+          steps: {},
+          traceId: 'trace-falsy-later',
+          spanId: 'span-falsy-later',
+        },
+        [
+          {
+            status: 'success',
+            result: { done: true },
+            steps: {},
+            traceId: 'trace-falsy-later',
+            spanId: 'span-falsy-later',
+          },
+        ],
+      );
+
+      const result = await executeTarget(mockWorkflow, 'workflow', {
+        id: 'item-falsy-later',
+        datasetId: 'ds-1',
+        input: { data: 'test' },
+        groundTruth: null,
+        version: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        resumeSteps: { 'branch-b': false },
+      });
+
+      expect(result.error).toBeNull();
+      const run = await (mockWorkflow.createRun as ReturnType<typeof vi.fn>).mock.results[0].value;
+      // A defined-but-falsy payload for a later branch must still be forwarded.
+      expect(run.resume).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resumeData: false,
+          step: 'branch-b',
         }),
       );
     });

@@ -194,14 +194,27 @@ describe('mountFactoryAuth gate (enabled)', () => {
     expect(mockAuthenticate).not.toHaveBeenCalled();
   });
 
-  it('does not bypass auth for non-POST GitHub webhook requests', async () => {
+  it('lets unauthenticated GitLab webhook deliveries reach the token-verifying route handler', async () => {
     mockAuthenticate.mockResolvedValue(null);
     const { app } = buildApp();
 
-    const res = await app.request('/web/github/webhook', { method: 'GET', headers: { Accept: 'application/json' } });
-    expect(res.status).toBe(401);
-    expect(await res.json()).toEqual({ error: 'unauthorized' });
+    const res = await app.request('/web/gitlab/webhook', { method: 'POST', headers: { Accept: 'application/json' } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('ok');
+    expect(mockAuthenticate).not.toHaveBeenCalled();
   });
+
+  it.each(['/web/github/webhook', '/web/gitlab/webhook'])(
+    'does not bypass auth for non-POST webhook request %s',
+    async path => {
+      mockAuthenticate.mockResolvedValue(null);
+      const { app } = buildApp();
+
+      const res = await app.request(path, { method: 'GET', headers: { Accept: 'application/json' } });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
+    },
+  );
 
   it('lets unauthenticated channel webhook deliveries reach the route handler', async () => {
     mockAuthenticate.mockResolvedValue(null);
@@ -551,6 +564,15 @@ describe('mountFactoryAuth /auth routes (enabled)', () => {
     expect(mockHandleCallback).not.toHaveBeenCalled();
   });
 
+  it('caps the denial values so a hostile IdP response cannot inflate the /signin URL', async () => {
+    const { app } = buildApp();
+    const res = await app.request(`/auth/callback?error=${'e'.repeat(200)}&error_description=${'d'.repeat(1000)}`);
+    expect(res.status).toBe(302);
+    const location = new URL(res.headers.get('location') ?? '', 'https://app.example');
+    expect(location.searchParams.get('error')).toBe('e'.repeat(64));
+    expect(location.searchParams.get('error_description')).toBe('d'.repeat(256));
+  });
+
   it('redirects callback back to login when the code exchange fails', async () => {
     mockHandleCallback.mockRejectedValue(new Error('expired code'));
     const { app } = buildApp();
@@ -597,6 +619,7 @@ describe('mountFactoryAuth /auth routes (enabled)', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       authenticated: true,
+      telemetryEnabled: false,
       // No-org accounts are bootstrapped into a personal org during /auth/me.
       user: {
         userId: 'user_me',
@@ -622,6 +645,7 @@ describe('mountFactoryAuth /auth routes (enabled)', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       authenticated: true,
+      telemetryEnabled: false,
       user: { email: 'user@example.com', name: 'User', organizationId: 'org_a', userId: 'user_1' },
       provider: 'workos',
     });

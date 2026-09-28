@@ -1,8 +1,10 @@
+import type { MastraClient } from '@mastra/client-js';
 import type { MastraDBMessage, MastraMessagePart } from '@mastra/core/agent/message-list';
 import { SpanType } from '@mastra/core/observability';
-import type { SpanRecord } from '@mastra/core/storage';
 import { formatHierarchicalSpans } from '@mastra/playground-ui/domains/traces/components/format-hierarchical-spans';
 import type { UISpan } from '@mastra/playground-ui/domains/traces/types';
+
+type SpanRecord = Awaited<ReturnType<MastraClient['getTrace']>>['spans'][number];
 
 const TOOL_SPAN_TYPES = new Set<string>([
   SpanType.TOOL_CALL,
@@ -136,11 +138,7 @@ const messageContent = (parts: MastraMessagePart[]) =>
 export interface TraceViewMastraDBMessage extends MastraDBMessage {
   /** Ids of the spans used to build this message, in visit order (root span first). */
   traceSpanIds: string[];
-  /** True when every part is text (no tool calls, no files). */
-  isTextOnly: boolean;
 }
-
-const isTextOnly = (parts: MastraMessagePart[]) => parts.every(part => part.type === 'text');
 
 export function formatTraceThreadMessages(spans: SpanRecord[]): TraceViewMastraDBMessage[] {
   const hierarchy = formatHierarchicalSpans(
@@ -172,7 +170,6 @@ export function formatTraceThreadMessages(spans: SpanRecord[]): TraceViewMastraD
       threadId,
       content: { format: 2, parts: userParts, content: messageContent(userParts) },
       traceSpanIds: [root.spanId],
-      isTextOnly: isTextOnly(userParts),
     },
     // One message per tool call so each part maps to exactly the spans behind it.
     ...tools.map<TraceViewMastraDBMessage>(({ part, spanIds }) => ({
@@ -182,7 +179,6 @@ export function formatTraceThreadMessages(spans: SpanRecord[]): TraceViewMastraD
       threadId,
       content: { format: 2, parts: [part], content: '' },
       traceSpanIds: [root.spanId, ...spanIds],
-      isTextOnly: false,
     })),
   ];
 
@@ -194,7 +190,6 @@ export function formatTraceThreadMessages(spans: SpanRecord[]): TraceViewMastraD
       threadId,
       content: { format: 2, parts: [{ type: 'text', text: responseText }], content: responseText },
       traceSpanIds: [root.spanId, ...textSpanIds],
-      isTextOnly: true,
     });
   }
 

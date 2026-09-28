@@ -1,8 +1,8 @@
 import { RequestContext } from '@mastra/core/request-context';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createBoardRegistry } from '../../../boards/index.js';
 
-import { defaultFactoryRules } from '../../../rules/defaults.js';
 import type { SourceControlStorageHandle } from '../../../storage/domains/source-control/base.js';
 import type { IntegrationContext } from '../../base.js';
 
@@ -10,7 +10,7 @@ import { createPlatformStorageForTests, mountApiRoutes } from '../test-utils.js'
 import { PlatformGithubIntegration } from './integration.js';
 
 const config = {
-  baseUrl: 'https://platform.example.com/v1',
+  baseUrl: 'https://platform.example.com',
   accessToken: 'platform-token',
 };
 
@@ -61,7 +61,7 @@ function json(data: unknown, status = 200): Response {
 }
 
 beforeEach(() => {
-  vi.stubEnv('MASTRA_SHARED_API_URL', config.baseUrl);
+  vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', config.baseUrl);
   vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', config.accessToken);
 });
 
@@ -480,6 +480,7 @@ describe('PlatformGithubIntegration', () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(json(pullRequest))
+      .mockResolvedValueOnce(json({ connected: false, githubUsername: null }))
       .mockResolvedValueOnce(
         json({
           id: 91,
@@ -509,9 +510,84 @@ describe('PlatformGithubIntegration', () => {
       actingUserId: 'user-42',
     });
 
-    for (const call of fetchImpl.mock.calls) {
-      expect((call[1] as RequestInit).headers).toMatchObject({ 'x-acting-user-id': 'user-42' });
-    }
+    expect((fetchImpl.mock.calls[0]?.[1] as RequestInit).headers).toMatchObject({ 'x-acting-user-id': 'user-42' });
+    expect((fetchImpl.mock.calls[2]?.[1] as RequestInit).headers).toMatchObject({ 'x-acting-user-id': 'user-42' });
+  });
+
+  it('assigns a PR to the verified GitHub account of its opener', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith('/pulls')) return json(pullRequest);
+      if (url.includes('/user-connection?')) return json({ connected: true, githubUsername: 'grace' });
+      if (url.endsWith('/token')) return json({ token: 'installation-token' });
+      if (url.endsWith('/issues/34/assignees')) return json({ assignees: [{ login: 'grace' }] });
+      throw new Error(`Unexpected request: ${url} ${init?.method}`);
+    });
+    const integration = createIntegration(fetchImpl);
+    const created = await integration.versionControl.createPullRequest({
+      connection: { type: 'app-installation', installationId: 7 },
+      sourceId: 'acme/app',
+      title: 'Ship intake',
+      baseBranch: 'main',
+      headBranch: 'feat/intake',
+      actingUserId: 'user-42',
+    });
+
+    expect(created.assignees).toEqual(['grace']);
+    expect(fetchImpl.mock.calls.map(call => String(call[0]))).toEqual([
+      'https://platform.example.com/v1/server/github/repos/acme/app/pulls',
+      'https://platform.example.com/v1/server/github-app/user-connection?userId=user-42',
+      'https://platform.example.com/v1/server/github-app/installations/7/token',
+      'https://api.github.com/repos/acme/app/issues/34/assignees',
+    ]);
+    expect(JSON.parse(String((fetchImpl.mock.calls[2]?.[1] as RequestInit).body))).toEqual({
+      repositories: ['app'],
+      permissions: { contents: 'write', issues: 'write', pull_requests: 'write' },
+    });
+    expect(JSON.parse(String((fetchImpl.mock.calls[3]?.[1] as RequestInit).body))).toEqual({ assignees: ['grace'] });
+  });
+
+  it('does not claim an assignment when GitHub silently ignores the requested user', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async input => {
+      const url = String(input);
+      if (url.endsWith('/pulls')) return json(pullRequest);
+      if (url.includes('/user-connection?')) return json({ connected: true, githubUsername: 'grace' });
+      if (url.endsWith('/token')) return json({ token: 'installation-token' });
+      if (url.endsWith('/issues/34/assignees')) return json({ assignees: [] });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const integration = createIntegration(fetchImpl);
+    const created = await integration.versionControl.createPullRequest({
+      connection: { type: 'app-installation', installationId: 7 },
+      sourceId: 'acme/app',
+      title: 'Ship intake',
+      baseBranch: 'main',
+      headBranch: 'feat/intake',
+      actingUserId: 'user-42',
+    });
+    expect(created.assignees).toEqual([]);
+  });
+
+  it('keeps a created PR when assignment fails', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async input => {
+      const url = String(input);
+      if (url.endsWith('/pulls')) return json(pullRequest);
+      if (url.includes('/user-connection?')) return json({ connected: true, githubUsername: 'grace' });
+      if (url.endsWith('/token')) return json({ token: 'installation-token' });
+      if (url.endsWith('/issues/34/assignees')) return json({ message: 'Forbidden' }, 403);
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const integration = createIntegration(fetchImpl);
+    await expect(
+      integration.versionControl.createPullRequest({
+        connection: { type: 'app-installation', installationId: 7 },
+        sourceId: 'acme/app',
+        title: 'Ship intake',
+        baseBranch: 'main',
+        headBranch: 'feat/intake',
+        actingUserId: 'user-42',
+      }),
+    ).resolves.toMatchObject({ id: '34', url: pullRequest.htmlUrl });
   });
 
   it('maps every version-control operation to its platform endpoint', async () => {
@@ -954,11 +1030,10 @@ describe('PlatformGithubIntegration', () => {
       },
       controller: {},
       stateSigner: {},
-      rules: {
-        config: defaultFactoryRules({
-          version: 'test-rules',
-        }),
+      runtime: {
+        configVersion: 'test-rules',
         workItems: seed.workItems,
+        boards: createBoardRegistry(),
       },
     } as unknown as IntegrationContext;
     integration.initialize?.({ storage: context.storage.generic });
@@ -1170,9 +1245,9 @@ describe('PlatformGithubIntegration', () => {
     });
   });
 
-  it('defaults the Platform base URL and requires a platform credential', () => {
-    vi.stubEnv('MASTRA_SHARED_API_URL', '');
-    expect(new PlatformGithubIntegration().diagnostics()).toMatchObject({ endpointHost: 'platform.mastra.ai' });
+  it('defaults the integrations API URL and requires a platform credential', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', '');
+    expect(new PlatformGithubIntegration().diagnostics()).toMatchObject({ endpointHost: 'integrations.mastra.ai' });
 
     vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', '');
     vi.stubEnv('MASTRA_PLATFORM_ACCESS_TOKEN', 'injected-token');
@@ -1334,6 +1409,20 @@ describe('PlatformGithubIntegration', () => {
         issues: { enabled: true },
       },
     });
+  });
+
+  it('removes one issue label through the Platform proxy and surfaces a missing label as a 404', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(json({})).mockResolvedValueOnce(json({}, 404));
+    const integration = createIntegration(fetchImpl);
+
+    await integration.removeIssueLabel(7, 'acme/app', 12, 'status: needs approval');
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(init?.method).toBe('DELETE');
+    expect(String(url)).toContain('/issues/12/labels/status%3A%20needs%20approval');
+
+    await expect(integration.removeIssueLabel(7, 'acme/app', 12, 'gone')).rejects.toMatchObject({ status: 404 });
+    await expect(integration.removeIssueLabel(7, 'acme/app', 12, '  ')).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   describe('resolveIntakeDispatch', () => {

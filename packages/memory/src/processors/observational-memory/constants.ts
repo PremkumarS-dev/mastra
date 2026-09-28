@@ -17,6 +17,7 @@ export const OBSERVATIONAL_MEMORY_DEFAULTS = {
       },
     },
     maxTokensPerBatch: 10_000,
+    observeAttachments: ['image/*', 'application/pdf'],
     // Async buffering defaults (enabled by default)
     bufferTokens: 0.2 as number | undefined, // Buffer every 20% of messageTokens
     bufferActivation: 0.8 as number | undefined, // Activate to retain 20% of threshold
@@ -59,6 +60,21 @@ Any messages following this reminder are newer and should take priority.`;
  * Full pattern: `${OBSERVATION_CONTEXT_PROMPT}\n\n<observations>\n${obs}\n</observations>\n\n${OBSERVATION_CONTEXT_INSTRUCTIONS}`
  */
 export const OBSERVATION_CONTEXT_PROMPT = `The following observations block contains your memory of past conversations with this user.`;
+
+/**
+ * Preamble used when observations are thread-scoped: they describe earlier parts
+ * of the current conversation, not other conversations.
+ */
+export const OBSERVATION_CONTEXT_PROMPT_THREAD = `The following observations block contains your memory of earlier parts of this current conversation. Everything recorded here (including IDs, artifacts, and tool results) came from this conversation and is available for you to reuse.`;
+
+/**
+ * Returns the observations preamble matching the memory scope.
+ * - `'thread'`: observations are earlier parts of the current conversation.
+ * - `'resource'`: observations span past conversations with this user.
+ */
+export function getObservationContextPrompt(scope: 'thread' | 'resource' = 'thread'): string {
+  return scope === 'resource' ? OBSERVATION_CONTEXT_PROMPT : OBSERVATION_CONTEXT_PROMPT_THREAD;
+}
 
 /**
  * Instructions that tell the model how to interpret and use observations.

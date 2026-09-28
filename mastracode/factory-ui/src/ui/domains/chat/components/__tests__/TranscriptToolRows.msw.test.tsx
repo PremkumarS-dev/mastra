@@ -1,5 +1,5 @@
 import type { MastraDBMessage, MastraMessagePart } from '@mastra/core/agent-controller';
-import { screen, waitFor, within } from '@testing-library/react';
+import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { describe, expect, it } from 'vitest';
@@ -118,6 +118,32 @@ describe('TranscriptEntries tool rows', () => {
     expect(within(row).queryByText('execute_command')).not.toBeInTheDocument();
   });
 
+  it("shows a shell command's description alone on its row and the command when expanded", async () => {
+    const command = "cd packages/core && rg -n 'processor' src";
+    renderEntries([
+      assistantMessage('msg-1', [
+        {
+          type: 'tool-invocation',
+          toolInvocation: {
+            state: 'result',
+            toolCallId: 'call-1',
+            toolName: 'execute_command',
+            args: { description: 'Finding the processor wiring', command },
+            result: 'src/a.ts:1:processor',
+          },
+        },
+      ]),
+    ]);
+
+    const row = screen.getByRole('group', { name: 'Tool: execute_command' });
+    expect(within(row).getByText('Finding the processor wiring')).toBeInTheDocument();
+    expect(within(row).queryByText('Run')).not.toBeInTheDocument();
+    expect(within(row).queryByText(/rg -n/)).not.toBeInTheDocument();
+
+    await userEvent.click(within(row).getAllByRole('button')[0]);
+    expect(within(row).getByText(/rg -n 'processor' src/)).toBeInTheDocument();
+  });
+
   it('collapses three or more consecutive tool calls into a single group row', async () => {
     renderEntries([
       assistantMessage('msg-1', [
@@ -134,37 +160,24 @@ describe('TranscriptEntries tool rows', () => {
     expect(screen.getAllByRole('group', { name: 'Tool: view' })).toHaveLength(2);
   });
 
-  it('leaves a run the reader watched expanded, even once the reply is done', () => {
-    const watched = [doneTool('call-1', 'view'), doneTool('call-2', 'search_content'), doneTool('call-3', 'view')];
-    const { rerender } = renderEntries([assistantMessage('msg-1', watched, undefined, true)]);
-
-    rerender(
-      <MemoryRouter>
-        <TranscriptEntries
-          entries={[assistantMessage('msg-1', watched, undefined, false)]}
-          onApprove={() => {}}
-          onRespond={() => {}}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.queryByRole('group', { name: 'Tool group: 3 steps' })).not.toBeInTheDocument();
-  });
-
-  it('leaves the tool rows of a still-arriving reply alone rather than swallowing what is being read', async () => {
+  it('folds a still-arriving run as it plays, so the reply reads as one busy row', async () => {
     renderEntries([
       assistantMessage(
         'msg-1',
-        [doneTool('call-1', 'view'), doneTool('call-2', 'search_content'), doneTool('call-3', 'view')],
+        [
+          doneTool('call-1', 'view'),
+          doneTool('call-2', 'search_content'),
+          runningTool('call-3', 'execute_command', { command: 'pnpm test' }),
+        ],
         undefined,
         true,
       ),
     ]);
 
-    await waitFor(() => expect(screen.getAllByRole('group', { name: 'Tool: view' })).toHaveLength(2), {
-      timeout: 5000,
-    });
-    expect(screen.queryByRole('group', { name: 'Tool group: 3 steps' })).not.toBeInTheDocument();
+    const group = await screen.findByRole('group', { name: 'Tool group: 3 steps' }, { timeout: 5000 });
+    expect(group).toHaveAttribute('aria-busy', 'true');
+    expect(within(group).getByText('pnpm test')).toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Tool: view' })).not.toBeInTheDocument();
   });
 
   it('surfaces the running action live on a collapsed group header', () => {
@@ -185,9 +198,10 @@ describe('TranscriptEntries tool rows', () => {
     expect(group).toHaveAttribute('aria-busy', 'true');
   });
 
-  it('keeps a call landing under the reader as its own row, even on an entry restored mid-run', async () => {
+  it('folds the rows above once a third call lands under the reader', async () => {
     const restored = [doneTool('call-1', 'view'), doneTool('call-2', 'view')];
     const { rerender } = renderEntries([assistantMessage('msg-1', restored)]);
+    expect(screen.getAllByRole('group', { name: 'Tool: view' })).toHaveLength(2);
 
     rerender(
       <MemoryRouter>
@@ -199,10 +213,8 @@ describe('TranscriptEntries tool rows', () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getAllByRole('group', { name: 'Tool: view' })).toHaveLength(3), {
-      timeout: 5000,
-    });
-    expect(screen.queryByRole('group', { name: /Tool group/ })).not.toBeInTheDocument();
+    await screen.findByRole('group', { name: 'Tool group: 3 steps' }, { timeout: 3000 });
+    expect(screen.queryByRole('group', { name: 'Tool: view' })).not.toBeInTheDocument();
   });
 
   it('keeps the words on screen in place when an ask_user prompt fills its slot above them', () => {
@@ -318,7 +330,7 @@ describe('TranscriptEntries tool rows', () => {
       assistantMessage('msg-1', [
         doneTool('call-1', 'view'),
         doneTool('call-2', 'view'),
-        runningTool('call-3', 'ask_user', {}),
+        runningTool('call-3', 'ask_user', { question: 'Which file should I edit?' }),
         doneTool('call-4', 'view'),
         doneTool('call-5', 'view'),
       ]),

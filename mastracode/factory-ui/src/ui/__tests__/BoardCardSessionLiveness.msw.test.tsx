@@ -11,7 +11,7 @@ import { createMemoryRouter, RouterProvider } from 'react-router';
 import { describe, expect, it } from 'vitest';
 
 import { server } from '../../../e2e/ui/msw-server';
-import { renderWithProviders, TEST_BASE_URL } from '../../../e2e/ui/render';
+import { renderWithProviders, TEST_BASE_URL, waitForMutationsIdle } from '../../../e2e/ui/render';
 import { queryKeys } from '../../api/keys';
 import { createQueryClient } from '../../query-client';
 import { AGENT_CONTROLLER_ID } from '../domains/chat/services/constants';
@@ -124,7 +124,7 @@ function stubFactoryWithBoundSession() {
     http.get(`${TEST_BASE_URL}/web/github/projects/${REPO_ID}/issues`, () =>
       HttpResponse.json({ issues: [], nextPage: null }),
     ),
-    http.get(`${TEST_BASE_URL}/web/github/projects/${REPO_ID}/sessions`, async () => {
+    http.get(`${TEST_BASE_URL}/web/source-control/projects/${REPO_ID}/sessions`, async () => {
       sessionListRequests += 1;
       if (sessionListRequests > 1) await refetchGate.promise;
       return HttpResponse.json({ sessions });
@@ -162,7 +162,9 @@ describe('Board card session liveness', () => {
     // refetch sees them: the card must trust its own ref, not the intersection.
     stubFactoryWithBoundSession();
     server.use(
-      http.get(`${TEST_BASE_URL}/web/github/projects/${REPO_ID}/sessions`, () => HttpResponse.json({ sessions: [] })),
+      http.get(`${TEST_BASE_URL}/web/source-control/projects/${REPO_ID}/sessions`, () =>
+        HttpResponse.json({ sessions: [] }),
+      ),
     );
     const user = userEvent.setup();
     renderWorkBoard();
@@ -181,7 +183,7 @@ describe('Board card session liveness', () => {
   it('shows the initializing dot while a bound session is still materializing', async () => {
     stubFactoryWithBoundSession();
     server.use(
-      http.get(`${TEST_BASE_URL}/web/github/projects/${REPO_ID}/sessions`, () =>
+      http.get(`${TEST_BASE_URL}/web/source-control/projects/${REPO_ID}/sessions`, () =>
         HttpResponse.json({ sessions: [{ ...boundSession, materializedAt: null }] }),
       ),
     );
@@ -248,10 +250,13 @@ describe('Board card session liveness', () => {
         HttpResponse.json({ runs: [{ runId: 'run-1', resourceId: SESSION_ID, threadId: SESSION_ID }] }),
       ),
     );
-    renderWorkBoard();
+    const { client } = renderWorkBoard();
 
     const card = await screen.findByTestId('work-item-card');
     await waitFor(() => expect(card.querySelector('[data-live-session-indicator="working"]')).not.toBeNull());
+    // The Retry check is only meaningful once the failed decision has loaded; otherwise
+    // it passes vacuously before the card ever had a Retry to hide.
+    await waitForMutationsIdle(client);
     expect(within(card).getByRole('link', { name: 'Open session' })).toBeInTheDocument();
     expect(within(card).queryByRole('button', { name: 'Retry' })).toBeNull();
   });

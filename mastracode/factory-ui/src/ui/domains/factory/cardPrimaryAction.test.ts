@@ -37,6 +37,13 @@ function item(sessions: Record<string, WorkItemSessionRef>): WorkItem {
 }
 
 describe('cardMoves', () => {
+  it.each(['github-issue', 'github-pr', 'linear-issue', 'jira-issue', 'incidentio-follow-up'] as const)(
+    'does not infer built-in automation for a custom-board %s',
+    source => {
+      expect(cardMoves({ source, board: 'release', metadata: {} }, 'intake')).toEqual([]);
+    },
+  );
+
   it('offers an issue its two lanes, and a needs-approval issue only the decision', () => {
     const issue = { source: 'github-issue' as const, metadata: {} };
     expect(cardMoves(issue, 'intake')).toEqual([investigate, build]);
@@ -52,10 +59,20 @@ describe('cardMoves', () => {
     ).toEqual([investigate, build]);
   });
 
+  it.each(['linear-issue', 'jira-issue', 'incidentio-follow-up'] as const)(
+    'offers a %s the same issue lanes',
+    source => {
+      expect(cardMoves({ source, metadata: {} }, 'intake')).toEqual([investigate, build]);
+    },
+  );
+
   it('re-reviews an open pull request sitting in Done, and reviews it in a working lane', () => {
     const pullRequest = { source: 'github-pr' as const, metadata: { state: 'open' }, stages: ['done'] };
     expect(cardMoves(pullRequest, 'done')).toEqual([{ label: 'Re-review', role: 'review', stage: 'review' }]);
     expect(cardMoves(pullRequest, 'review')).toEqual([review]);
+    const mergeRequest = { ...pullRequest, source: 'gitlab-pr' as const };
+    expect(cardMoves(mergeRequest, 'done')).toEqual([{ label: 'Re-review', role: 'review', stage: 'review' }]);
+    expect(cardMoves(mergeRequest, 'review')).toEqual([review]);
   });
 
   it('offers a Work card in Review no lane, so its session is the action', () => {
@@ -107,6 +124,21 @@ describe('cardPrimaryAction', () => {
     expect(action?.label).toBe('Resume');
     action?.start();
     expect(onMove).toHaveBeenCalledWith('planning');
+  });
+
+  it('advances a custom-board card to its next declared phase instead of starting a session', () => {
+    const onMove = vi.fn();
+    const action = cardPrimaryAction({
+      ...handlers,
+      item: { ...item({}), board: 'release', stages: ['queued'] },
+      nextPhase: { id: 'preparing', label: 'Preparing' },
+      hasSession: false,
+      onMove,
+    });
+
+    expect(action?.label).toBe('Move to Preparing');
+    action?.start();
+    expect(onMove).toHaveBeenCalledWith('preparing');
   });
 
   it('asks for the maintainer decision on a held non-bug card instead of offering its lane', () => {

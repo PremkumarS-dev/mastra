@@ -1,7 +1,10 @@
 import type { AnchorHTMLAttributes, ReactNode } from 'react';
 import { forwardRef } from 'react';
-import { LinkComponentProvider } from '@/lib/framework';
-import type { LinkComponentProviderProps } from '@/lib/framework';
+// Imported through the package's public exports on purpose: CI's Changed Test
+// Gate typechecks this file against the base branch (see `paths` below), and
+// `@/exports` keeps exposing the provider wherever its implementation lives.
+import { LinkComponentProvider } from '@/exports';
+import type { LinkComponentProviderProps } from '@/exports';
 
 /**
  * Anchor stub for tests that render components which route through the framework
@@ -60,11 +63,11 @@ const paths: Record<string, (...args: string[]) => string> = {
   workflowRunLink: (workflowId, runId) => `/workflows/${workflowId}/runs/${runId}`,
   datasetLink: id => `/datasets/${id}`,
   datasetItemLink: (datasetId, itemId) => `/datasets/${datasetId}/items/${itemId}`,
-  datasetItemCompareLink: (datasetId, itemId, secondItemId) =>
-    `/datasets/${datasetId}/items/${itemId}/compare/${secondItemId}`,
   // Only used by the base branch's `LinkComponentPaths` (see comment above).
   datasetExperimentLink: (datasetId, experimentId) => `/datasets/${datasetId}/experiments/${experimentId}`,
   experimentLink: id => `/experiments/${id}`,
+  experimentItemLink: (id, itemId) => `/experiments/${id}/items/${itemId}`,
+  traceLink: (traceId, spanId) => `/traces?traceId=${traceId}${spanId ? `&spanId=${spanId}` : ''}`,
 };
 
 // eslint-disable-next-line react-refresh/only-export-components -- test helper co-located with the provider.

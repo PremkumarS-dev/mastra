@@ -1,5 +1,21 @@
 export { BoardDefinitionError, defineBoard } from './define-board.js';
-export type { BoardDefinition, BoardPhaseDefinition, BoardTransition } from './define-board.js';
+export type {
+  BoardDefinition,
+  BoardPhaseDefinition,
+  BoardPhaseKind,
+  BoardToolResultRuleHandler,
+  BoardToolRule,
+  BoardToolRules,
+  BoardTransition,
+} from './define-board.js';
+export {
+  boardForWorkItem,
+  isTerminalWorkItem,
+  resolveBoardToolRule,
+  resolvePhaseSemantics,
+  workItemPhaseSemantics,
+} from './semantics.js';
+export type { PhaseSemantics } from './semantics.js';
 export type {
   BoardTransitionPolicy,
   BoardTransitionPolicyContext,

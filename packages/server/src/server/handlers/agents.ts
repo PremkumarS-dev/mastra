@@ -26,13 +26,7 @@ import type { PublicSchema } from '@mastra/schema-compat/schema';
 import { stringify } from 'superjson';
 
 import { z } from 'zod/v4';
-import {
-  MASTRA_IS_STUDIO_KEY,
-  MASTRA_RESOURCE_ID_KEY,
-  WORKSPACE_TOOLS,
-  isReservedRequestContextKey,
-  resolveToolConfig,
-} from '../constants';
+import { MASTRA_IS_STUDIO_KEY, MASTRA_RESOURCE_ID_KEY, WORKSPACE_TOOLS, resolveToolConfig } from '../constants';
 import type { WorkspaceToolName } from '../constants';
 import { MastraFGAPermissions } from '../fga-permissions';
 
@@ -72,6 +66,8 @@ import {
   subscribeAgentThreadBodySchema,
   abortAgentThreadBodySchema,
   abortAgentThreadResponseSchema,
+  cancelPendingAgentSignalsBodySchema,
+  cancelPendingAgentSignalsResponseSchema,
   streamUntilIdleBodySchema,
   resumeStreamBodySchema,
   resumeStreamUntilIdleBodySchema,
@@ -95,6 +91,7 @@ import {
   requireEffectiveResourceId,
   getEffectiveThreadId,
   enforceThreadAccess,
+  mergeBodyRequestContext,
   validateThreadOwnership,
   validateRunOwnership,
 } from './utils';
@@ -139,19 +136,6 @@ function getIsStudioFromContext(requestContext: RequestContext): boolean {
   return requestContext.get(MASTRA_IS_STUDIO_KEY) === true;
 }
 
-function mergeBodyRequestContext(serverRequestContext: RequestContext, bodyRequestContext: unknown): void {
-  if (!bodyRequestContext || typeof bodyRequestContext !== 'object') {
-    return;
-  }
-
-  for (const [key, value] of Object.entries(bodyRequestContext)) {
-    if (isReservedRequestContextKey(key)) continue;
-    if (serverRequestContext.get(key) === undefined) {
-      serverRequestContext.set(key, value);
-    }
-  }
-}
-
 function normalizePublicExecutionOptions(
   options: Record<string, unknown> | undefined,
   serverRequestContext: RequestContext,
@@ -193,24 +177,30 @@ function hasSuspendedToolCall(snapshot: Record<string, any>, toolCallId: string)
   return visit(snapshot.context);
 }
 
+function getDurableLoopWorkflowName(agent: DurableAgentLike): string {
+  return agent.durableLoopWorkflowName ?? DurableStepIds.AGENTIC_LOOP;
+}
+
 async function validateDurableToolCallAccess({
   mastra,
   agent,
   runId,
   toolCallId,
   requestContext,
+  threadId,
 }: {
   mastra: any;
   agent: Agent;
   runId: string;
-  toolCallId: string;
+  toolCallId?: string;
   requestContext: RequestContext;
+  threadId?: string;
 }): Promise<void> {
   if (!isDurableAgentLike(agent)) return;
 
   const workflowsStore = await mastra.getStorage()?.getStore('workflows');
   const workflowRun = await workflowsStore?.getWorkflowRunById({
-    workflowName: DurableStepIds.AGENTIC_LOOP,
+    workflowName: getDurableLoopWorkflowName(agent),
     runId,
   });
   if (!workflowRun) {
@@ -241,11 +231,16 @@ async function validateDurableToolCallAccess({
     throw new HTTPException(403, { message: 'Access denied: durable run belongs to a different resource' });
   }
 
+  const persistedThreadId = input?.state?.threadId ?? input?.messageListState?.memoryInfo?.threadId;
+  if (threadId && persistedThreadId !== threadId) {
+    throw new HTTPException(403, { message: 'Access denied: durable run belongs to a different thread' });
+  }
+
   if (
     !snapshot ||
     snapshot.status !== 'suspended' ||
     input?.agentId !== agent.id ||
-    !hasSuspendedToolCall(snapshot, toolCallId)
+    (toolCallId !== undefined && !hasSuspendedToolCall(snapshot, toolCallId))
   ) {
     throw new HTTPException(403, { message: 'Access denied: tool call is not suspended on this durable run' });
   }
@@ -353,6 +348,7 @@ export interface SerializedSkill {
 
 export interface SerializedTool {
   id: string;
+  title?: string;
   description?: string;
   inputSchema?: string;
   outputSchema?: string;
@@ -714,7 +710,9 @@ async function formatAgentList({
   if (typeof agent.getMetadata === 'function') {
     try {
       metadata = await agent.getMetadata({ requestContext });
-    } catch {}
+    } catch (error) {
+      logger.warn(`Failed to get metadata for agent ${agent.name}`, { error });
+    }
   }
 
   let instructions: SystemMessage | undefined;
@@ -999,15 +997,29 @@ async function formatAgent({
   requestContext: RequestContext;
   isStudio: boolean;
 }): Promise<SerializedAgent> {
+  const logger = mastra.getLogger();
   const description = agent.getDescription();
+
+  // Per-agent dynamic getters can throw when their callbacks depend on request
+  // context that isn't present for a plain metadata read (e.g. a dynamic model
+  // resolver that requires a session). Mirror formatAgentList: wrap each
+  // independent getter so one failure doesn't turn the whole detail request
+  // into a 500 — the unresolved fields are simply omitted and the failure logged.
   let metadata: Record<string, unknown> | undefined;
   if (typeof agent.getMetadata === 'function') {
     try {
       metadata = await agent.getMetadata({ requestContext });
-    } catch {}
+    } catch (error) {
+      logger.warn(`Failed to get metadata for agent ${agent.name}`, { error });
+    }
   }
 
-  const tools = await agent.listTools({ requestContext });
+  let tools: Record<string, SerializedToolInput | object> = {};
+  try {
+    tools = await agent.listTools({ requestContext });
+  } catch (error) {
+    logger.warn('Error listing tools for agent', { agentName: agent.name, error });
+  }
   const serializedAgentTools = await getSerializedAgentTools(tools);
 
   let serializedAgentWorkflows: Record<
@@ -1016,7 +1028,6 @@ async function formatAgent({
   > = {};
 
   if ('listWorkflows' in agent) {
-    const logger = mastra.getLogger();
     try {
       const workflows = await agent.listWorkflows({ requestContext });
 
@@ -1061,20 +1072,53 @@ async function formatAgent({
       })
     : requestContext;
 
-  const instructions = await agent.getInstructions({ requestContext: instructionsRequestContext });
-  const llm = await agent.getLLM({ requestContext });
-  const defaultGenerateOptionsLegacy = await agent.getDefaultGenerateOptionsLegacy({
-    requestContext,
-  });
-  const defaultStreamOptionsLegacy = await agent.getDefaultStreamOptionsLegacy({ requestContext });
-  const defaultOptions = await agent.getDefaultOptions({ requestContext });
+  let instructions: SystemMessage | undefined;
+  try {
+    instructions = await agent.getInstructions({ requestContext: instructionsRequestContext });
+  } catch (error) {
+    logger.warn('Error getting instructions for agent', { agentName: agent.name, error });
+  }
+
+  let llm: Awaited<ReturnType<Agent['getLLM']>> | undefined;
+  try {
+    llm = await agent.getLLM({ requestContext });
+  } catch (error) {
+    logger.warn('Error getting LLM for agent', { agentName: agent.name, error });
+  }
+
+  let defaultGenerateOptionsLegacy: Awaited<ReturnType<Agent['getDefaultGenerateOptionsLegacy']>> | undefined;
+  try {
+    defaultGenerateOptionsLegacy = await agent.getDefaultGenerateOptionsLegacy({ requestContext });
+  } catch (error) {
+    logger.warn('Error getting default generate options for agent', { agentName: agent.name, error });
+  }
+
+  let defaultStreamOptionsLegacy: Awaited<ReturnType<Agent['getDefaultStreamOptionsLegacy']>> | undefined;
+  try {
+    defaultStreamOptionsLegacy = await agent.getDefaultStreamOptionsLegacy({ requestContext });
+  } catch (error) {
+    logger.warn('Error getting default stream options for agent', { agentName: agent.name, error });
+  }
+
+  let defaultOptions: Awaited<ReturnType<Agent['getDefaultOptions']>> | undefined;
+  try {
+    defaultOptions = await agent.getDefaultOptions({ requestContext });
+  } catch (error) {
+    logger.warn('Error getting default options for agent', { agentName: agent.name, error });
+  }
 
   const model = llm?.getModel();
   const supportsMemory =
     typeof (agent as Agent & { supportsMemory?: () => boolean }).supportsMemory === 'function'
       ? (agent as Agent & { supportsMemory: () => boolean }).supportsMemory()
       : true;
-  const models = await agent.getModelList(requestContext);
+
+  let models: Awaited<ReturnType<Agent['getModelList']>> | undefined;
+  try {
+    models = await agent.getModelList(requestContext);
+  } catch (error) {
+    logger.warn('Error getting model list for agent', { agentName: agent.name, error });
+  }
   const modelList = models?.map(md => ({
     ...md,
     model: {
@@ -1084,7 +1128,7 @@ async function formatAgent({
     },
   }));
 
-  const serializedAgentAgents = await getSerializedAgentDefinition({ agent, requestContext });
+  const serializedAgentAgents = await getSerializedAgentDefinition({ agent, requestContext, logger });
 
   // Get and serialize only user-configured processors (excludes memory-derived processors)
   // This ensures the UI only shows processors explicitly configured by the user
@@ -1097,13 +1141,13 @@ async function formatAgent({
     serializedInputProcessors = getSerializedProcessors(inputProcessorWorkflows);
     serializedOutputProcessors = getSerializedProcessors(outputProcessorWorkflows);
   } catch (error) {
-    mastra.getLogger().error('Error getting configured processors for agent', { agentName: agent.name, error });
+    logger.error('Error getting configured processors for agent', { agentName: agent.name, error });
   }
 
   // Extract skills, workspace tools, and workspaceId from agent's workspace
   const serializedSkills = await getSerializedSkillsFromAgent(agent, requestContext);
   const workspaceTools = await getWorkspaceToolsFromAgent(agent, requestContext);
-  const browserTools = getBrowserToolsFromAgent(agent, createBrowserToolsErrorLogger(mastra.getLogger(), agent.id));
+  const browserTools = getBrowserToolsFromAgent(agent, createBrowserToolsErrorLogger(logger, agent.id));
 
   // Get workspaceId if agent has a workspace
   let workspaceId: string | undefined;
@@ -1123,7 +1167,7 @@ async function formatAgent({
     try {
       serializedRequestContextSchema = stringify(zodToJsonSchema(agent.requestContextSchema));
     } catch (error) {
-      mastra.getLogger().error('Error serializing requestContextSchema for agent', { agentName: agent.name, error });
+      logger.error('Error serializing requestContextSchema for agent', { agentName: agent.name, error });
     }
   }
 
@@ -2164,12 +2208,26 @@ export const ABORT_AGENT_THREAD_ROUTE = createRoute({
   tags: ['Agents', 'Streaming'],
   requiresAuth: true,
   requiresPermission: 'agents:execute',
-  handler: async ({ mastra, agentId, resourceId, threadId, requestContext: serverRequestContext }) => {
+  handler: async ({
+    mastra,
+    agentId,
+    resourceId,
+    threadId,
+    clearPendingSignals,
+    expectedRunId,
+    requestContext: serverRequestContext,
+  }) => {
     try {
       const agent = await getAgentFromSystem({ mastra, agentId, requestContext: serverRequestContext });
       if (typeof (agent as { abortThreadStream?: unknown }).abortThreadStream !== 'function') {
         throw new HTTPException(501, {
           message: 'agent thread aborts are not supported by this Mastra core version',
+        });
+      }
+      if (clearPendingSignals && agent.__supportsThreadSignalCancellation !== true) {
+        throw new HTTPException(501, {
+          message:
+            'clear-on-abort requires a newer @mastra/core version. Upgrade @mastra/core alongside @mastra/server.',
         });
       }
 
@@ -2180,18 +2238,70 @@ export const ABORT_AGENT_THREAD_ROUTE = createRoute({
         throw new HTTPException(400, { message: 'threadId is required' });
       }
 
-      if (effectiveResourceId) {
-        const memory = await agent.getMemory({ requestContext: serverRequestContext });
-        if (memory) {
-          const thread = await memory.getThreadById({ threadId: effectiveThreadId });
-          await validateThreadOwnership(thread, effectiveResourceId);
-        }
-      }
+      const memory = await agent.getMemory({ requestContext: serverRequestContext });
+      const thread = await memory?.getThreadById({ threadId: effectiveThreadId });
+      await enforceThreadAccess({
+        mastra,
+        requestContext: serverRequestContext,
+        threadId: effectiveThreadId,
+        thread,
+        effectiveResourceId,
+        permission: MastraFGAPermissions.MEMORY_WRITE,
+      });
 
-      const aborted = await agent.abortThreadStream({ resourceId: effectiveResourceId, threadId: effectiveThreadId });
+      const aborted = await agent.abortThreadStream({
+        resourceId: effectiveResourceId,
+        threadId: effectiveThreadId,
+        ...(clearPendingSignals === undefined ? {} : { clearPendingSignals }),
+        expectedRunId,
+      });
       return { aborted };
     } catch (error) {
       return handleError(error, 'error aborting agent thread');
+    }
+  },
+});
+
+export const CANCEL_AGENT_PENDING_SIGNALS_ROUTE = createRoute({
+  method: 'POST',
+  path: '/agents/:agentId/threads/signals/cancel',
+  responseType: 'json' as const,
+  pathParamSchema: agentIdPathParams,
+  bodySchema: cancelPendingAgentSignalsBodySchema,
+  responseSchema: cancelPendingAgentSignalsResponseSchema,
+  summary: 'Cancel pending thread signals',
+  description: 'Cancels selected pending thread signals and propagates requested IDs through PubSub',
+  tags: ['Agents', 'Streaming'],
+  requiresAuth: true,
+  requiresPermission: 'agents:execute',
+  handler: async ({ mastra, agentId, resourceId, threadId, signalIds, requestContext }) => {
+    try {
+      const agent = await getAgentFromSystem({ mastra, agentId, requestContext });
+      if (
+        typeof (agent as { cancelQueuedMessages?: unknown }).cancelQueuedMessages !== 'function' ||
+        agent.__supportsThreadSignalCancellation !== true
+      ) {
+        throw new HTTPException(501, {
+          message:
+            'thread-wide cancellation requires a newer @mastra/core version. Upgrade @mastra/core alongside @mastra/server.',
+        });
+      }
+      const effectiveResourceId = getEffectiveResourceId(requestContext, resourceId);
+      const effectiveThreadId = getEffectiveThreadId(requestContext, threadId);
+      if (!effectiveThreadId) throw new HTTPException(400, { message: 'threadId is required' });
+      const memory = await agent.getMemory({ requestContext });
+      const thread = await memory?.getThreadById({ threadId: effectiveThreadId });
+      await enforceThreadAccess({
+        mastra,
+        requestContext,
+        threadId: effectiveThreadId,
+        thread,
+        effectiveResourceId,
+        permission: MastraFGAPermissions.MEMORY_WRITE,
+      });
+      return agent.cancelQueuedMessages({ resourceId: effectiveResourceId, threadId: effectiveThreadId, signalIds });
+    } catch (error) {
+      return handleError(error, 'error cancelling pending thread signals');
     }
   },
 });
@@ -2210,7 +2320,15 @@ export const SUBSCRIBE_AGENT_THREAD_ROUTE = createRoute({
   tags: ['Agents', 'Streaming'],
   requiresAuth: true,
   requiresPermission: 'agents:execute',
-  handler: async ({ mastra, agentId, resourceId, threadId, abortSignal, requestContext: serverRequestContext }) => {
+  handler: async ({
+    mastra,
+    agentId,
+    resourceId,
+    threadId,
+    withInitialHistory,
+    abortSignal,
+    requestContext: serverRequestContext,
+  }) => {
     try {
       const agent = await getAgentFromSystem({ mastra, agentId, requestContext: serverRequestContext });
       if (typeof (agent as { subscribeToThread?: unknown }).subscribeToThread !== 'function') {
@@ -2226,7 +2344,20 @@ export const SUBSCRIBE_AGENT_THREAD_ROUTE = createRoute({
         throw new HTTPException(400, { message: 'threadId is required' });
       }
 
-      if (effectiveResourceId) {
+      if (withInitialHistory) {
+        // History returns stored messages, so apply the same checks as the messages route.
+        const memory = await agent.getMemory({ requestContext: serverRequestContext });
+        if (memory) {
+          const thread = await memory.getThreadById({ threadId: effectiveThreadId });
+          await enforceThreadAccess({
+            mastra,
+            requestContext: serverRequestContext,
+            threadId: effectiveThreadId,
+            thread,
+            effectiveResourceId,
+          });
+        }
+      } else if (effectiveResourceId) {
         const memory = await agent.getMemory({ requestContext: serverRequestContext });
         if (memory) {
           const thread = await memory.getThreadById({ threadId: effectiveThreadId });
@@ -2237,6 +2368,7 @@ export const SUBSCRIBE_AGENT_THREAD_ROUTE = createRoute({
       const subscription = await agent.subscribeToThread({
         resourceId: effectiveResourceId,
         threadId: effectiveThreadId,
+        ...(withInitialHistory ? { withInitialHistory, requestContext: serverRequestContext } : {}),
       });
 
       let cleanedUp = false;
@@ -2852,6 +2984,15 @@ export const RESUME_STREAM_ROUTE = createRoute({
         } as NonNullable<typeof authorizedMemoryOption>;
       }
 
+      await validateDurableToolCallAccess({
+        mastra,
+        agent,
+        runId,
+        toolCallId,
+        requestContext: serverRequestContext,
+        threadId: effectiveThreadId,
+      });
+
       const workflowsStore = await mastra.getStorage()?.getStore('workflows');
       const workflowRun = await workflowsStore?.getWorkflowRunById({ workflowName: 'agentic-loop', runId });
       await validateRunOwnership(workflowRun, getEffectiveResourceId(serverRequestContext, undefined));
@@ -2939,7 +3080,7 @@ export const RECOVER_ROUTE = createRoute({
 
       const workflowsStore = await mastra.getStorage()?.getStore('workflows');
       const workflowRun = await workflowsStore?.getWorkflowRunById({
-        workflowName: DurableStepIds.AGENTIC_LOOP,
+        workflowName: getDurableLoopWorkflowName(agent),
         runId,
       });
       await validateRunOwnership(workflowRun, getEffectiveResourceId(serverRequestContext, undefined));
@@ -3044,6 +3185,15 @@ export const RESUME_STREAM_UNTIL_IDLE_ROUTE = createRoute({
           ...(effectiveThreadId ? { thread: effectiveThreadId } : {}),
         } as NonNullable<typeof authorizedMemoryOption>;
       }
+
+      await validateDurableToolCallAccess({
+        mastra,
+        agent,
+        runId,
+        toolCallId,
+        requestContext: serverRequestContext,
+        threadId: effectiveThreadId,
+      });
 
       const workflowsStore = await mastra.getStorage()?.getStore('workflows');
       const workflowRun = await workflowsStore?.getWorkflowRunById({ workflowName: 'agentic-loop', runId });
@@ -3634,7 +3784,7 @@ export const GET_AGENT_SKILL_ROUTE = createRoute({
       }
 
       // Use the optional ?path= query param for disambiguation, otherwise fall back to name
-      const identifier = path ? decodeURIComponent(path) : skillName;
+      const identifier = path ?? skillName;
 
       // Get the skill from the agent (searches both inline and workspace skills)
       const skill = await agent.getSkill(identifier, { requestContext });

@@ -9,11 +9,13 @@ import { AuditLogList } from '../domains/factory/components/audit/AuditLogList';
 import { AuditCategoryFilter } from '../domains/factory/components/audit/AuditCategoryFilter';
 import { AuditRangePicker } from '../domains/factory/components/audit/AuditRangePicker';
 import { AuditTimeline } from '../domains/factory/components/audit/AuditTimeline';
-import { DocumentFactoryPageShell } from '../domains/factory/components/FactoryPageShell';
+import { PageLayout } from '@mastra/playground-ui/components/PageLayout';
+import { useSidebarHeaderSlots } from '../domains/chat/components/useSidebarHeaderSlots';
+import { useActiveFactory } from '../domains/workspaces/components/FactoryLayout';
 import {
   AUDIT_CATEGORIES,
-  auditActionsForCategories,
   auditEventBounds,
+  auditNamespacesForCategories,
   auditRangeLabel,
   eventInAuditRange,
   type AuditNamespace,
@@ -46,7 +48,7 @@ function AuditLogEmptyState({
         }
       : {
           title: 'No audit events yet',
-          description: 'Work items, runs, worktrees and agent activity land here as they happen.',
+          description: 'Work items, runs, git and agent activity land here as they happen.',
           reset: undefined,
         };
 
@@ -54,12 +56,12 @@ function AuditLogEmptyState({
     <EmptyState
       className="min-h-48"
       as="h2"
-      iconSlot={<ScrollText className="text-icon3 size-5" aria-hidden />}
+      iconSlot={<ScrollText aria-hidden />}
       titleSlot={state.title}
       descriptionSlot={state.description}
       actionSlot={
         state.reset ? (
-          <Button variant="outline" size="sm" onClick={state.reset.onClick}>
+          <Button size="sm" onClick={state.reset.onClick}>
             {state.reset.label}
           </Button>
         ) : undefined
@@ -69,17 +71,21 @@ function AuditLogEmptyState({
 }
 
 export function AuditPage() {
+  const factory = useActiveFactory();
+  const slots = useSidebarHeaderSlots();
   return (
-    <DocumentFactoryPageShell>{project => <AuditContent factoryProjectId={project.id} />}</DocumentFactoryPageShell>
+    <PageLayout {...slots}>
+      <AuditContent factoryProjectId={factory.id} />
+    </PageLayout>
   );
 }
 
 function AuditContent({ factoryProjectId }: { factoryProjectId: string | undefined }) {
   const [selectedCategories, setSelectedCategories] = useState(() => new Set<AuditNamespace>());
   const [selectedRange, setSelectedRange] = useState<AuditTimeRange>();
-  const actions = auditActionsForCategories(selectedCategories);
+  const namespaces = auditNamespacesForCategories(selectedCategories);
   const filterKey = selectedCategories.size === 0 ? 'all' : [...selectedCategories].toSorted().join(',');
-  const eventsQuery = useAuditEvents(factoryProjectId, filterKey, actions);
+  const eventsQuery = useAuditEvents(factoryProjectId, filterKey, namespaces);
   // The axis spans everything loaded, not the current filter: categories are compared by
   // toggling them, and a scale that rescales under each toggle makes marks impossible to place.
   const historyQuery = useAuditEvents(factoryProjectId, 'all', undefined);
@@ -118,11 +124,10 @@ function AuditContent({ factoryProjectId }: { factoryProjectId: string | undefin
     <section className="flex min-w-0 flex-1 flex-col gap-3" aria-label="Audit history">
       <h1 className="sr-only">Audit log</h1>
 
-      <div className="min-h-form-xs flex items-center justify-end">
+      <div className="min-h-control-sm flex items-center justify-end">
         {portalUrl ? (
           <Button
-            variant="outline"
-            size="xs"
+            size="sm"
             onClick={() => {
               window.open(portalUrl, '_blank', 'noopener,noreferrer');
               void portalQuery.refetch();
@@ -139,7 +144,7 @@ function AuditContent({ factoryProjectId }: { factoryProjectId: string | undefin
             <AuditTimeline events={events} bounds={bounds} range={selectedRange} />
           </AuditRangePicker>
         ) : (
-          <p className="text-ui-xs text-neutral2 flex h-28 items-center justify-center">Nothing recorded yet</p>
+          <p className="text-meta text-placeholder flex h-28 items-center justify-center">Nothing recorded yet</p>
         )}
         <AuditCategoryFilter
           selectedCategories={selectedCategories}
@@ -170,7 +175,6 @@ function AuditContent({ factoryProjectId }: { factoryProjectId: string | undefin
             events={visibleEvents}
             actorNames={actorNames}
             hasNextPage={eventsQuery.hasNextPage}
-            autoLoad={!selectedRange}
             isFetchingNextPage={eventsQuery.isFetchingNextPage}
             onLoadMore={() => void eventsQuery.fetchNextPage()}
           />

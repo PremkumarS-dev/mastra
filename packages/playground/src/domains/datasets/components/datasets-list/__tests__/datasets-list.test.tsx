@@ -1,9 +1,10 @@
-import { screen, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, screen, within } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 
 import { DatasetsList } from '../datasets-list';
 import type { DatasetsListProps } from '../datasets-list';
 import { datasets, experiments, mixedExperiments } from './fixtures/datasets';
+import { expectComputedTag } from '@/test/computed-tag';
 import { TestLinkProvider } from '@/test/link-provider';
 import { renderWithProviders } from '@/test/render';
 
@@ -58,6 +59,13 @@ describe('DatasetsList', () => {
       expect(within(row).getByText('+1')).toBeTruthy();
       expect(within(row).getByTitle('support, english, reviewed')).toBeTruthy();
     });
+
+    it('renders each visible tag with colors computed from its value', () => {
+      renderList();
+      const row = screen.getByRole('link', { name: /Dataset A/ });
+      expectComputedTag(within(row).getByText('support'), 'support');
+      expectComputedTag(within(row).getByText('english'), 'english');
+    });
   });
 
   describe('when a dataset has completed and failed experiments', () => {
@@ -103,6 +111,37 @@ describe('DatasetsList', () => {
     it('does not show dataset links', () => {
       renderList({ tagFilter: 'missing' });
       expect(screen.queryAllByRole('link')).toHaveLength(0);
+    });
+  });
+
+  describe('when an onSelectDataset handler is provided', () => {
+    it('renders rows as buttons instead of links and reports the clicked dataset', () => {
+      const onSelectDataset = vi.fn();
+      renderList({ onSelectDataset });
+      expect(screen.queryAllByRole('link')).toHaveLength(0);
+      fireEvent.click(screen.getByRole('button', { name: /Dataset A/ }));
+      expect(onSelectDataset).toHaveBeenCalledWith(expect.objectContaining({ id: 'ds-a' }));
+    });
+
+    it('keeps the experiments badge as plain text inside the row', () => {
+      renderList({ onSelectDataset: vi.fn() });
+      const row = screen.getByRole('button', { name: /Dataset A/ });
+      expect(within(row).getByText('2 (100%)')).toBeTruthy();
+    });
+
+    it('marks the selected dataset row as featured', () => {
+      renderList({ onSelectDataset: vi.fn(), selectedDatasetId: 'ds-a' });
+      expect(screen.getByRole('button', { name: /Dataset A/ }).dataset.featured).toBe('true');
+      expect(screen.getByRole('button', { name: /Dataset B/ }).dataset.featured).toBeUndefined();
+    });
+
+    it('lets the caller override the trailing cell per dataset', () => {
+      renderList({
+        onSelectDataset: vi.fn(),
+        renderTrailingCell: ds => (ds.id === 'ds-a' ? <span>Generating...</span> : null),
+      });
+      expect(within(screen.getByRole('button', { name: /Dataset A/ })).getByText('Generating...')).toBeTruthy();
+      expect(within(screen.getByRole('button', { name: /Dataset A/ })).queryByText('2 (100%)')).toBeNull();
     });
   });
 });

@@ -34,6 +34,8 @@ import type {
   BatchDeleteTracesArgs,
   CreateFeedbackArgs,
   CreateScoreArgs,
+  DeleteFeedbackArgs,
+  DeleteScoresArgs,
   CreateSpanArgs,
   GetEntityNamesArgs,
   GetEntityNamesResponse,
@@ -98,14 +100,20 @@ import type {
   ListScoresResponse,
   ListTracesArgs,
   ListTracesResponse,
+  GetTraceQueryValuesResponse,
   ObservabilityStorageStrategy,
   PruneOptions,
   PruneResult,
   RetentionTablesDescriptor,
+  QueryThreadsResult,
   ScoreRecord,
   TableRetentionPolicy,
+  TraceQueryObservedFieldsResult,
   TraceQueryResponse,
+  TrustedThreadQueryPlan,
+  TrustedTraceQueryObservedFieldsPlan,
   TrustedTraceQueryPlan,
+  TrustedTraceQueryValuesPlan,
 } from '@mastra/core/storage';
 
 import type { DbClient } from '../../../client';
@@ -155,7 +163,13 @@ export type VNextPostgresObservabilityConfig = PgDomainConfig & {
 };
 
 function wrapError(op: string, error: unknown, details?: Record<string, unknown>): never {
-  if (error instanceof MastraError || error instanceof coreStorage.TraceQueryExecutionError) throw error;
+  if (
+    error instanceof MastraError ||
+    error instanceof coreStorage.TraceQueryCursorError ||
+    error instanceof coreStorage.TraceQueryExecutionError ||
+    error instanceof coreStorage.TraceQueryResourceLimitError
+  )
+    throw error;
   throw new MastraError(
     {
       id: createStorageErrorId('PG', op, 'FAILED'),
@@ -346,8 +360,41 @@ export class ObservabilityStoragePostgresVNext extends ObservabilityStorage {
   }
 
   override getFeatures() {
-    if (!deltaPollingFeatureEnabled()) return ['metrics', 'logs', 'trace-query'] as const;
-    return ['metrics', 'logs', 'delta-polling', 'trace-query'] as const;
+    if (!deltaPollingFeatureEnabled()) {
+      return [
+        'metrics',
+        'logs',
+        'entity-type-discovery',
+        'entity-name-discovery',
+        'service-name-discovery',
+        'environment-discovery',
+        'tag-discovery',
+        'metric-discovery',
+        'trace-query',
+        'trace-query-root-duration',
+        'trace-query-discovery',
+        'thread-query',
+        'trace-query-tenant-scope',
+        'feedback',
+      ] as const;
+    }
+    return [
+      'metrics',
+      'logs',
+      'entity-type-discovery',
+      'entity-name-discovery',
+      'service-name-discovery',
+      'environment-discovery',
+      'tag-discovery',
+      'metric-discovery',
+      'delta-polling',
+      'trace-query',
+      'trace-query-root-duration',
+      'trace-query-discovery',
+      'thread-query',
+      'trace-query-tenant-scope',
+      'feedback',
+    ] as const;
   }
 
   async #run<T>(op: string, fn: () => Promise<T>, details?: Record<string, unknown>): Promise<T> {
@@ -421,6 +468,26 @@ export class ObservabilityStoragePostgresVNext extends ObservabilityStorage {
     );
   }
 
+  override async getTraceQueryObservedFields(
+    plan: TrustedTraceQueryObservedFieldsPlan,
+  ): Promise<TraceQueryObservedFieldsResult> {
+    return this.#run('GET_TRACE_QUERY_OBSERVED_FIELDS', () =>
+      traceQueryOps.getTraceQueryObservedFields(this.#readClient, this.#schema, plan, this.#traceQueryTimeoutMs),
+    );
+  }
+
+  override async getTraceQueryValues(plan: TrustedTraceQueryValuesPlan): Promise<GetTraceQueryValuesResponse> {
+    return this.#run('GET_TRACE_QUERY_VALUES', () =>
+      traceQueryOps.getTraceQueryValues(this.#readClient, this.#schema, plan, this.#traceQueryTimeoutMs),
+    );
+  }
+
+  override async queryThreads(plan: TrustedThreadQueryPlan): Promise<QueryThreadsResult> {
+    return this.#run('QUERY_THREADS', () =>
+      traceQueryOps.queryThreads(this.#readClient, this.#schema, plan, this.#traceQueryTimeoutMs),
+    );
+  }
+
   override async listBranches(args: ListBranchesArgs): Promise<ListBranchesResponse> {
     return this.#run('LIST_BRANCHES', () => tracesOps.listBranches(this.#readClient, this.#schema, args));
   }
@@ -458,6 +525,22 @@ export class ObservabilityStoragePostgresVNext extends ObservabilityStorage {
   override async batchCreateFeedback(args: BatchCreateFeedbackArgs): Promise<void> {
     await this.#run('BATCH_CREATE_FEEDBACK', () => feedbackOps.batchCreateFeedback(this.#client, this.#schema, args), {
       count: args.feedbacks.length,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Scores / feedback — deletes
+  // -------------------------------------------------------------------------
+
+  override async deleteScores(args: DeleteScoresArgs): Promise<void> {
+    await this.#run('DELETE_SCORES', () => scoresOps.deleteScores(this.#client, this.#schema, args), {
+      count: args.scoreIds.length,
+    });
+  }
+
+  override async deleteFeedback(args: DeleteFeedbackArgs): Promise<void> {
+    await this.#run('DELETE_FEEDBACK', () => feedbackOps.deleteFeedback(this.#client, this.#schema, args), {
+      count: args.feedbackIds.length,
     });
   }
 
